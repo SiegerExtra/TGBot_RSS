@@ -1,4 +1,4 @@
-module TGBot_own
+module TGBot_RSS_SiegerExtra
 
 go 1.24
 

@@ -1,3 +1,22 @@
+/*
+TGBot_RSS/SiegerExtra @ github.com/SiegerExtra/TGBot_RSS
+	Forked from notoriously CN-only interface app/code by AbBai @ github.com/IonRh/TGBot_RSS
+	-> because you know, not all of us are from CN, and thus unwilling to tolerate it =)
+
+Changelog:
+v1.0.6
+	Changed standart mode output to also include subscription/feed name;
+	Changed original fixed CN-timeZone to be instead configurable via config.json\TimeZone;
+
+v1.0.5
+	Elaborated keywords to allow for spaces, e.g. 'key word';
+	Changed original keywords separator from ','' to '#!#';
+
+v1.0.4
+	Fully replaced all CN-strings with EN-strings;
+	Reworked database access so it uses connections efficiently;
+*/
+
 package main
 
 import (
@@ -355,27 +374,40 @@ func processSubscription(db *sql.DB, sub Subscription, userKeywords map[int64][]
 			}
 			formattedKeywords := strings.Join(keywordCodes, " ")
 
-			// Format publication time in UTC+8
-			formattedDate := msg.PubDate.In(time.FixedZone("UTC+8", 8*60*60)).Format("2006-01-02 15:04:05")
+			// Load the configured TimeZone
+			loc, err := time.LoadLocation(globalConfig.TimeZone)
+			if err != nil {
+				// Fallback to UTC if timezone is invalid
+				logMessage("warn", fmt.Sprintf("Invalid timezone '%s', falling back to UTC", globalConfig.TimeZone))
+				loc = time.UTC
+			}
+
+			// Format the time with timezone offset
+			tzTime := msg.PubDate.In(loc)
+			formattedDate := tzTime.Format("2006-01-02 15:04:05")
+			timezoneOffset := tzTime.Format("-07")
 
 			var htmlMessage, otherpush string
 
+			// Modify message formatting to include the timezone offset
 			if sub.Channel == 1 {
-				// Channel mode: include description and optional image
+				// Channel mode👋📶: include description and optional image
 				imageURL := extractImageURL(msg.Description)
 				cleanDescription := cleanHTMLContent(msg.Description)
-				htmlMessage = fmt.Sprintf("👋 %s: %s\n🕒 %s\n%s\n", sub.Name, formattedKeywords, formattedDate, cleanDescription)
-				otherpush = fmt.Sprintf("👋 %s\n🕒 %s\n%s", sub.Name, formattedDate, cleanDescription)
+				
+				htmlMessage = fmt.Sprintf("👋📶 %s: %s\n🕒 %s %s\n%s\n", sub.Name, formattedKeywords, formattedDate, timezoneOffset, cleanDescription)
+				otherpush = fmt.Sprintf("👋📶 %s\n🕒 %s %s\n%s", sub.Name, formattedDate, timezoneOffset, cleanDescription)
+				
 				if imageURL != "" {
 					go sendPhotoMessage(userID, imageURL, htmlMessage)
 				} else {
 					go sendHTMLMessage(userID, htmlMessage)
 				}
 			} else {
-				// Standard mode: title + link
-				htmlMessage = fmt.Sprintf("📌 %s\n🔖 Keywords: %s\n🕒 %s\n🔗 %s",
-					msg.Title, formattedKeywords, formattedDate, msg.Link)
-				otherpush = fmt.Sprintf("📌 %s\n🕒 %s\n🔗 %s", msg.Title, formattedDate, msg.Link)
+				// Standard mode📡📶: feed + post title + link
+				htmlMessage = fmt.Sprintf("📡📶 %s\n\n📌 %s\n\n🔖 Keywords: %s\n\n🕒 %s %s\n\n🔗 %s",
+					sub.Name, msg.Title, formattedKeywords, formattedDate, timezoneOffset, msg.Link)
+				otherpush = fmt.Sprintf("📡📶 %s\n\n📌 %s\n\n🕒 %s %s\n\n🔗 %s", sub.Name, msg.Title, formattedDate, timezoneOffset, msg.Link)
 				go sendHTMLMessage(userID, htmlMessage)
 			}
 

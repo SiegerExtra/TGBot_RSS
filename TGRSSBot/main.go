@@ -1,11 +1,16 @@
 /*
-TGBot_RSS/SiegerExtra @ https://github.com/SiegerExtra/TGBot_RSS
-	Original CN-only source code by AbBai @ github.com/IonRh/TGBot_RSS
+TGBot_RSS/SiegerExtra @ github.com/SiegerExtra/TGBot_RSS
+	Forked from notoriously CN-only interface app/code by AbBai @ github.com/IonRh/TGBot_RSS
+	-> because you know, not all of us are from CN, and thus unwilling to tolerate it =)
 
 Changelog:
+v1.0.6
+	Changed standart mode output to also include subscription/feed name;
+	Changed original fixed CN-timeZone to be instead configurable via config.json\TimeZone;
+
 v1.0.5
-	Changed keywords separator from ',' to '#!#';
-	Allowed keywords to contain spaces;
+	Elaborated keywords to allow for spaces, e.g. 'key word';
+	Changed original keywords separator from ','' to '#!#';
 
 v1.0.4
 	Fully replaced all CN-strings with EN-strings;
@@ -74,6 +79,7 @@ type Config struct {
 	Debug     bool   `json:"Debug"`     // Enable debug logging
 	ProxyURL  string `json:"ProxyURL"`  // Optional proxy server URL
 	Pushinfo  string `json:"Pushinfo"`  // Push notification endpoint template
+	TimeZone  string `json:"TimeZone"`  // IANA timezone name, e.g. "Asia/Riyadh"
 }
 
 // Message holds a parsed RSS feed entry.
@@ -869,6 +875,11 @@ func main() {
 		log.Fatal("Failed to load config:", err)
 	}
 
+	// Set default TimeZone if not configured
+	if globalConfig.TimeZone == "" {
+		globalConfig.TimeZone = "UTC"
+	}
+
 	asciiArt := `
   _________.__                          ___________         __                 
  /   _____/|__| ____   ____   __________\_   _____/__  ____/  |_____________   
@@ -1114,7 +1125,7 @@ func showHelp(userID int64, messageID int) {
 • Omitting +FeedName matches all subscribed feeds
 
 📦 Repository: github.com/SiegerExtra/TGBot_RSS
-🔧 Feedback:   https://github.com/SiegerExtra/TGBot_RSS`, count)
+🔧 Feedback:   github.com/SiegerExtra/TGBot_RSS`, count)
 
 	keyboard := CreateBackButton()
 	messageSender.SendHTMLResponse(userID, messageID, helpText, &keyboard, true)
