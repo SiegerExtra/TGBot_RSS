@@ -6,6 +6,6 @@
   "ProxyURL": "",
   "Pushinfo": "",
   "TimeZone": "Asia/Riyadh",
-  "RSSpollDelay": 1,
+  "RSSpollDelay": 10,
   "TGmsgDelay": 35
 }

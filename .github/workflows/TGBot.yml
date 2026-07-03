@@ -1,4 +1,4 @@
-name: Build and Release Go Binary
+name: Build and Release Go Binaries (Linux, Windows)
 
 on:
   workflow_dispatch:
@@ -17,74 +17,94 @@ jobs:
     permissions:
       contents: write
     steps:
-      # 检出代码
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 在 Docker 容器中构建 Linux 二进制（关键：容器内直接修复权限）
-      - name: Build Linux binaries in Docker
+      - name: Set environment variables
+        run: echo "VERSION=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
+
+      - name: Build binaries in Docker
         run: |
-          # 获取构建时间和Git提交信息
-          BUILD_TIME=$(date -u '+%Y-%m-%d_%H:%M:%S_UTC')
+          BUILD_TIME=$(date -u '+%Y%m%d%H%M%S')
           GIT_COMMIT=$(git rev-parse --short HEAD)
-          VERSION=${{ github.event.inputs.tag }}
           
           echo "Building with:"
-          echo "  Version: $VERSION"
-          echo "  Build Time: $BUILD_TIME"
+          echo "  Version: ${{ env.VERSION }}"
+          echo "  Build: $BUILD_TIME"
           echo "  Git Commit: $GIT_COMMIT"
           
-          LDFLAGS="-w -s -X 'main.version=${VERSION}' -X 'main.buildTime=${BUILD_TIME}' -X 'main.gitCommit=${GIT_COMMIT}'"
+          LDFLAGS="-w -s -X 'main.version=${{ env.VERSION }}' -X 'main.buildTime=${BUILD_TIME}' -X 'main.gitCommit=${GIT_COMMIT}'"
           echo "LDFLAGS: $LDFLAGS"
+          
           docker run --rm \
             -v $(pwd)/TGRSSBot:/go/src/app \
             -w /go/src/app \
-            golang:1.24-bullseye /bin/bash -c "
+            golang:bullseye /bin/bash -c "
               set -e
               apt-get update && apt-get install -y --no-install-recommends \
                 git ca-certificates zip \
                 gcc g++ \
                 gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
                 gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+                gcc-mingw-w64-x86-64 \
+                gcc-mingw-w64-i686 \
               && apt-get clean
               
               mkdir -p dist
-              CGO_ENABLED=1 GOOS=linux GOARCH=amd64 CC=gcc go build -o dist/TGBot-linux-amd64 -ldflags='$LDFLAGS' *.go
-              CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc go build -o dist/TGBot-linux-arm64 -ldflags='$LDFLAGS' *.go
-              CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 CC=arm-linux-gnueabihf-gcc go build -o dist/TGBot-linux-armv7 -ldflags='$LDFLAGS' *.go
               
-              # 关键：用宿主机用户 UID/GID 修复权限，避免后续无法访问
+              # Linux builds (CGO enabled)
+              CGO_ENABLED=1 GOOS=linux GOARCH=amd64 CC=gcc go build -o dist/TGBot_RSS-linux-amd64 -ldflags='$LDFLAGS' *.go
+              CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc go build -o dist/TGBot_RSS-linux-arm64 -ldflags='$LDFLAGS' *.go
+              CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 CC=arm-linux-gnueabihf-gcc go build -o dist/TGBot_RSS-linux-armv7 -ldflags='$LDFLAGS' *.go
+              
+              # Windows builds (CGO enabled with MinGW)
+              CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc go build -o dist/TGBot_RSS-windows-amd64.exe -ldflags='$LDFLAGS' *.go
+              CGO_ENABLED=1 GOOS=windows GOARCH=386 CC=i686-w64-mingw32-gcc go build -o dist/TGBot_RSS-windows-386.exe -ldflags='$LDFLAGS' *.go
+              
               chown -R $(id -u):$(id -g) dist
             "
 
-      # 拷贝 config.json 并打包为 tar.gz（路径改为 TGRSSBot/config.json）
       - name: Package binaries with config.json
         run: |
           cp TGRSSBot/config.json TGRSSBot/dist/
           cd TGRSSBot/dist
-          mv TGBot-linux-amd64 TGBot_RSS && tar -czvf TGBot-linux-amd64.tar.gz TGBot_RSS config.json && rm TGBot_RSS
-          mv TGBot-linux-arm64 TGBot_RSS && tar -czvf TGBot-linux-arm64.tar.gz TGBot_RSS config.json && rm TGBot_RSS
-          mv TGBot-linux-armv7 TGBot_RSS && tar -czvf TGBot-linux-armv7.tar.gz TGBot_RSS config.json && rm TGBot_RSS
+          
+          # Linux archives
+          HW_ARCH="amd64 arm64 armv7"
+          for ARCH in $HW_ARCH; do
+            mv "TGBot_RSS-linux-${ARCH}" "TGBot_RSS-${{ env.VERSION }}-linux-${ARCH}"
+            tar -czvf "TGBot_RSS-${{ env.VERSION }}-linux-${ARCH}.tar.gz" "TGBot_RSS-${{ env.VERSION }}-linux-${ARCH}" config.json
+            rm "TGBot_RSS-${{ env.VERSION }}-linux-${ARCH}"
+          done
+          
+          # Windows archives
+          HW_ARCH_WIN="amd64 386"
+          for ARCH in $HW_ARCH_WIN; do
+            mv "TGBot_RSS-windows-${ARCH}.exe" "TGBot_RSS-${{ env.VERSION }}-windows-${ARCH}.exe"
+            zip "TGBot_RSS-${{ env.VERSION }}-windows-${ARCH}.zip" "TGBot_RSS-${{ env.VERSION }}-windows-${ARCH}.exe" config.json
+            rm "TGBot_RSS-${{ env.VERSION }}-windows-${ARCH}.exe"
+          done
+          
           rm config.json
 
-      # 创建或更新 Git 标签
       - name: Generate checksums
         run: |
           cd TGRSSBot/dist
-          sha256sum TGBot-*.tar.gz > checksums.txt
+          sha256sum * > TGBot_RSS_${{ env.VERSION }}_Checksums.sha256
 
-      # 创建 Release 并上传文件
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag }}
+          tag_name: ${{ env.VERSION }}
           files: |
-            TGRSSBot/dist/TGBot-linux-amd64.tar.gz
-            TGRSSBot/dist/TGBot-linux-arm64.tar.gz
-            TGRSSBot/dist/TGBot-linux-armv7.tar.gz
-            TGRSSBot/dist/checksums.txt
+            TGRSSBot/dist/TGBot_RSS-${{ env.VERSION }}-linux-amd64.tar.gz
+            TGRSSBot/dist/TGBot_RSS-${{ env.VERSION }}-linux-arm64.tar.gz
+            TGRSSBot/dist/TGBot_RSS-${{ env.VERSION }}-linux-armv7.tar.gz
+            TGRSSBot/dist/TGBot_RSS-${{ env.VERSION }}-windows-amd64.zip
+            TGRSSBot/dist/TGBot_RSS-${{ env.VERSION }}-windows-386.zip
+            TGRSSBot/dist/TGBot_RSS_${{ env.VERSION }}_checksums.sha256
           body: ${{ github.event.inputs.release_notes }}
           generate_release_notes: false
         env:
