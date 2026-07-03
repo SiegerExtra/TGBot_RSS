@@ -3,6 +3,10 @@ TGBot_RSS/SiegerExtra @ https://github.com/SiegerExtra/TGBot_RSS
 	Original CN-only source code by AbBai @ github.com/IonRh/TGBot_RSS
 
 Changelog:
+v1.0.5
+	Changed keywords separator from ',' to '#!#';
+	Allowed keywords to contain spaces;
+
 v1.0.4
 	Fully replaced all CN-strings with EN-strings;
 	Reworked database access so it uses connections efficiently;
@@ -13,15 +17,24 @@ Cross-compiling for Linux on Windows
 //CGO-free compilation cmd, only for CGO-free packages:
 //$env:GOOS = "linux"; $env:GOARCH = "amd64"; go build -ldflags "-X main.version=v1.0.4" -o TGBot_RSS
 
-Because of go-sqlite3 requiring CGO (C lang code parts for Go), and cross-compiling for Linux on Windows, install Zig which provides C cross-compiler that targets Linux
+Because of go-sqlite3 requiring CGO (C lang code parts for Go), and cross-compiling for Linux on Windows,
+install Zig which provides C cross-compiler that targets Linux
 winget install zig.zig --scope machine
+OR
+use WSL/VM for native Linux compiling
 
 CGO-enabled compilation cmd:
-$env:GOOS = "linux"; $env:GOARCH = "amd64"; $env:CGO_ENABLED="1"; $env:CC = "zig cc -target x86_64-linux-gnu"; go build -ldflags "-X main.version=v1.0.4" -o TGBot_RSS
+$env:GOOS = "linux"; $env:GOARCH = "amd64"; $env:CGO_ENABLED="1"; $env:CC = "zig cc -target x86_64-linux-gnu"; go build -ldflags "-X main.version=v1.0.0" -o TGBot_RSS
 
 Alternatively, to use pure-Go SQLite drivers, like modernc.org/sqlite or github.com/ncruces/go-sqlite3
 */
-// Versioning sample: -ldflags "-X main.version=v1.2.3 -X main.buildTime=$(date -u +%F) -X main.gitCommit=$(git rev-parse --short HEAD)"
+/*
+Versioning samples:
+-ldflags "-X main.version=v1.2.3 -X main.buildTime=$(date -u +%F) -X main.gitCommit=$(git rev-parse --short HEAD)"
+
+-ldflags "-X main.version=v1.2.3 -X main.buildTime=$(Get-Date -Format 'yyyyMMddHHmmss')"
+$env:GOOS = "linux"; $env:GOARCH = "amd64"; $env:CGO_ENABLED="1"; $env:CC = "zig cc -target x86_64-linux-gnu"; go build -ldflags "-X main.version=v1.0.0 -X main.buildTime=$(Get-Date -Format 'yyyyMMddHHmmss')" -o TGBot_RSS
+*/
 
 package main
 
@@ -48,7 +61,7 @@ import (
 
 // Version information — set at build time via -ldflags:
 var (
-	version   = "1.0.4"
+	version   = "1.0.0"
 	buildTime = "-"
 	gitCommit = "-"
 )
@@ -561,18 +574,18 @@ func (h *UserActionHandler) handleKeywordAction(userID int64, messageID int, act
 	switch action {
 	case "add_prompt":
 		setUserState(userID, "add_keyword", messageID, nil)
-		text := "Please enter the keyword(s) to add. Separate multiple keywords with commas.\n\n" +
+		text := "Please enter the keyword(s) to add. Separate multiple keywords with #!#\n\n" +
 			"💡 Matching tips:\n" +
 			" * matches any sequence of characters\n" +
 			" -keyword blocks content containing that keyword\n" +
-			"Example: you*great*   matches \"you are so great!\"\n" +
-			"Example: -dislike     blocks content containing \"dislike\"\n\n" +
+			"Example: you*great* matches \"you are so great!\"\n" +
+			"Example: -dislike blocks content containing \"dislike\"\n\n" +
 			"💡 Scope prefixes:\n" +
 			"#t keyword — title only\n" +
 			"#c keyword — description only\n" +
 			"#a keyword — title and description\n" +
-			"Example: #ttechnology   matches \"technology\" in titles only\n" +
-			"Example: #cnews         matches \"news\" in descriptions only\n\n" +
+			"Example: #ttechnology matches \"technology\" in titles only\n" +
+			"Example: #cnews matches \"news\" in descriptions only\n\n" +
 			"💡 RSS filter:\n" +
 			"keyword+FeedName — restrict matching to a specific feed\n" +
 			"Example: tech+TechNews  only matches the feed named \"TechNews\"\n\n" +
@@ -1000,22 +1013,36 @@ func handleStateMessage(message *tgbotapi.Message, state *UserState) {
 	}
 }
 
-// handleKeywordInput processes free-text keyword input from the user.
+// handleKeywordInput processes free-text keyword input from the user
+// Allowed keyword to contain spaces, and changed separator from ',' to '#!#'
 func handleKeywordInput(message *tgbotapi.Message) {
-	userID := message.From.ID
-	text := strings.TrimSpace(message.Text)
-	if text == "" {
-		messageSender.SendError(userID, 0, "❌ Please enter a valid keyword.")
-		return
-	}
+    userID := message.From.ID
+    text := strings.TrimSpace(message.Text)
+    if text == "" {
+        messageSender.SendError(userID, 0, "❌ Please enter a valid keyword.")
+        return
+    }
 
-	keywords := strings.Fields(text)
-	if len(keywords) == 0 {
-		messageSender.SendError(userID, 0, "❌ Please enter a valid keyword.")
-		return
-	}
+    var keywords []string
 
-	actionHandler.HandleAction(userID, 0, "keyword", "add", keywords...)
+    // Split by #!# separator
+    if strings.Contains(text, "#!#") {
+        for _, part := range strings.Split(text, "#!#") {
+            if trimmed := strings.TrimSpace(part); trimmed != "" {
+                keywords = append(keywords, trimmed)
+            }
+        }
+    } else {
+        // No separator: treat the entire input as one keyword
+        keywords = []string{text}
+    }
+
+    if len(keywords) == 0 {
+        messageSender.SendError(userID, 0, "❌ Please enter a valid keyword.")
+        return
+    }
+
+    actionHandler.HandleAction(userID, 0, "keyword", "add", keywords...)
 }
 
 // handleSubscriptionInput processes free-text subscription input from the user.
