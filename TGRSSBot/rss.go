@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -15,7 +14,7 @@ import (
 	"github.com/mmcdole/gofeed"
 )
 
-// 获取所有订阅
+// getSubscriptions returns all RSS subscriptions from the database.
 func getSubscriptions(db *sql.DB) ([]Subscription, error) {
 	rows, err := db.Query("SELECT subscription_id, rss_url, rss_name, users, channel FROM subscriptions")
 	if err != nil {
@@ -30,11 +29,10 @@ func getSubscriptions(db *sql.DB) ([]Subscription, error) {
 		var channel int
 
 		if err := rows.Scan(&sub.ID, &sub.URL, &sub.Name, &usersStr, &channel); err != nil {
-			logMessage("error", fmt.Sprintf("读取订阅失败: %v", err))
+			logMessage("error", fmt.Sprintf("Failed to scan subscription row: %v", err))
 			continue
 		}
 
-		// 解析用户ID列表
 		sub.Users = parseUserIDs(usersStr)
 		sub.Channel = channel
 		subscriptions = append(subscriptions, sub)
@@ -43,7 +41,7 @@ func getSubscriptions(db *sql.DB) ([]Subscription, error) {
 	return subscriptions, nil
 }
 
-// 解析用户ID字符串
+// parseUserIDs converts a stored user-ID string (JSON array or legacy CSV) to a slice.
 func parseUserIDs(usersStr string) []int64 {
 	usersStr = strings.Trim(usersStr, "[] ")
 	if usersStr == "" {
@@ -60,7 +58,7 @@ func parseUserIDs(usersStr string) []int64 {
 	return userIDs
 }
 
-// 获取用户关键词
+// getUserKeywords loads the keyword map (userID → keywords) from the database.
 func getUserKeywords(db *sql.DB) (map[int64][]string, error) {
 	rows, err := db.Query("SELECT user_id, keywords FROM user_keywords")
 	if err != nil {
@@ -77,7 +75,6 @@ func getUserKeywords(db *sql.DB) (map[int64][]string, error) {
 			continue
 		}
 
-		// 解析关键词
 		keywords := parseKeywords(keywordsStr)
 		if len(keywords) > 0 {
 			userKeywords[userID] = keywords
@@ -87,14 +84,14 @@ func getUserKeywords(db *sql.DB) (map[int64][]string, error) {
 	return userKeywords, nil
 }
 
-// 解析关键词字符串
+// parseKeywords parses a stored keyword string (JSON array or comma-separated).
 func parseKeywords(keywordsStr string) []string {
 	keywordsStr = strings.TrimSpace(keywordsStr)
 	if keywordsStr == "" {
 		return nil
 	}
 
-	// 如果是 JSON 数组格式
+	// JSON array format
 	if strings.HasPrefix(keywordsStr, "[") && strings.HasSuffix(keywordsStr, "]") {
 		var keywords []string
 		if err := json.Unmarshal([]byte(keywordsStr), &keywords); err == nil {
@@ -102,7 +99,7 @@ func parseKeywords(keywordsStr string) []string {
 		}
 	}
 
-	// 如果不是 JSON 格式，按照逗号分割
+	// Fallback: comma-separated
 	var keywords []string
 	for _, kw := range strings.Split(keywordsStr, ",") {
 		kw = strings.TrimSpace(kw)
@@ -113,12 +110,12 @@ func parseKeywords(keywordsStr string) []string {
 	return keywords
 }
 
-// 获取RSS内容
+// fetchRSS retrieves new items from the feed and returns only those published
+// after the last recorded update time.
 func fetchRSS(db *sql.DB, sub Subscription, client *http.Client) ([]Message, error) {
 	parser := gofeed.NewParser()
 	parser.Client = client
 
-	// 获取RSS内容
 	feed, err := parser.ParseURL(sub.URL)
 	if err != nil {
 		return nil, err
@@ -128,14 +125,12 @@ func fetchRSS(db *sql.DB, sub Subscription, client *http.Client) ([]Message, err
 		return nil, nil
 	}
 
-	// 获取上次更新时间
 	lastUpdateTime, err := getLastUpdateTime(db, sub.Name)
 	if err != nil {
-		logMessage("error", fmt.Sprintf("获取更新时间失败: %v", err))
-		lastUpdateTime = time.Time{} // 使用零时间
+		logMessage("error", fmt.Sprintf("Failed to read last update time: %v", err))
+		lastUpdateTime = time.Time{}
 	}
 
-	// 处理新消息
 	var messages []Message
 	var latestTime time.Time
 
@@ -145,7 +140,6 @@ func fetchRSS(db *sql.DB, sub Subscription, client *http.Client) ([]Message, err
 			latestTime = pubTime
 		}
 
-		// 只添加新的内容
 		if pubTime.After(lastUpdateTime) {
 			messages = append(messages, Message{
 				Title:       item.Title,
@@ -156,7 +150,6 @@ func fetchRSS(db *sql.DB, sub Subscription, client *http.Client) ([]Message, err
 		}
 	}
 
-	// 更新最后更新时间
 	if !latestTime.IsZero() {
 		updateLastTime(db, sub.Name, latestTime, feed.Items[0].Title)
 	}
@@ -164,7 +157,8 @@ func fetchRSS(db *sql.DB, sub Subscription, client *http.Client) ([]Message, err
 	return messages, nil
 }
 
-// 获取RSS项目的时间
+// getItemTime returns the publication time of a feed item, falling back to
+// UpdatedParsed and then time.Now() if neither field is set.
 func getItemTime(item *gofeed.Item) time.Time {
 	if item.PublishedParsed != nil {
 		return item.PublishedParsed.UTC()
@@ -175,15 +169,19 @@ func getItemTime(item *gofeed.Item) time.Time {
 	return time.Now().UTC()
 }
 
-// 获取上次更新时间
+// getLastUpdateTime retrieves the last recorded update time for rssName.
+// On first call it inserts a sentinel record so future updates are relative to now.
 func getLastUpdateTime(db *sql.DB, rssName string) (time.Time, error) {
 	var timeStr string
 	err := db.QueryRow("SELECT last_update_time FROM feed_data WHERE rss_name = ?", rssName).Scan(&timeStr)
 
 	if err == sql.ErrNoRows {
-		// 首次运行，插入记录
-		_, err = db.Exec("INSERT INTO feed_data (rss_name, last_update_time, latest_title) VALUES (?, ?, ?)",
-			rssName, time.Now().Format("2006-01-02 15:04:05"), "")
+		// First run — seed the record with the current time so we do not
+		// immediately re-deliver all historical items.
+		_, err = db.Exec(
+			"INSERT INTO feed_data (rss_name, last_update_time, latest_title) VALUES (?, ?, ?)",
+			rssName, time.Now().Format("2006-01-02 15:04:05"), "",
+		)
 		return time.Time{}, err
 	}
 
@@ -194,16 +192,19 @@ func getLastUpdateTime(db *sql.DB, rssName string) (time.Time, error) {
 	return time.Parse("2006-01-02 15:04:05", timeStr)
 }
 
-// 更新最后更新时间
+// updateLastTime persists the latest publication time and article title for rssName.
 func updateLastTime(db *sql.DB, rssName string, updateTime time.Time, title string) {
-	_, err := db.Exec("UPDATE feed_data SET last_update_time = ?, latest_title = ? WHERE rss_name = ?",
-		updateTime.Format("2006-01-02 15:04:05"), title, rssName)
+	_, err := db.Exec(
+		"UPDATE feed_data SET last_update_time = ?, latest_title = ? WHERE rss_name = ?",
+		updateTime.Format("2006-01-02 15:04:05"), title, rssName,
+	)
 	if err != nil {
-		logMessage("error", fmt.Sprintf("更新时间失败: %v", err))
+		logMessage("error", fmt.Sprintf("Failed to update last time: %v", err))
 	}
 }
 
-// 检查消息是否匹配关键词，返回匹配到的关键词列表
+// matchesKeywords checks msg against keywords and returns the matched keyword
+// names, or nil if no match (or a block keyword fires).
 func matchesKeywords(msg Message, keywords []string, rssName string) []string {
 	if len(keywords) == 0 {
 		return nil
@@ -212,72 +213,60 @@ func matchesKeywords(msg Message, keywords []string, rssName string) []string {
 	var matchedKeywords []string
 	var blockedKeywords []string
 
-	// 准备不同的匹配内容
 	titleContent := strings.ToLower(msg.Title)
 	descContent := strings.ToLower(msg.Description)
 	allContent := strings.ToLower(msg.Title + " " + msg.Description)
 
-	// 首先检查是否命中屏蔽词
 	for _, keyword := range keywords {
 		keyword = strings.TrimSpace(keyword)
 		if keyword == "" {
 			continue
 		}
 
-		// 检查是否是屏蔽关键词
+		// Block keyword prefix
 		isBlockKeyword := strings.HasPrefix(keyword, "-")
 		if isBlockKeyword {
 			keyword = strings.TrimPrefix(keyword, "-")
-			//fmt.Println("屏蔽关键词:", keyword)
 		}
 
-		// 检查匹配范围前缀 (#t=标题, #c=描述, #a=全部)
-		var matchScope string = "default" // default表示只匹配标题（保持向后兼容）
-		var processedKeyword string = keyword
+		// Match scope prefix (#t = title, #c = description, #a = all)
+		matchScope := "default" // default = title only (backwards-compatible)
+		processedKeyword := keyword
 
-		if strings.HasPrefix(keyword, "#t") {
+		switch {
+		case strings.HasPrefix(keyword, "#t"):
 			matchScope = "title"
 			processedKeyword = strings.TrimPrefix(keyword, "#t")
-		} else if strings.HasPrefix(keyword, "#c") {
+		case strings.HasPrefix(keyword, "#c"):
 			matchScope = "description"
 			processedKeyword = strings.TrimPrefix(keyword, "#c")
-		} else if strings.HasPrefix(keyword, "#a") {
+		case strings.HasPrefix(keyword, "#a"):
 			matchScope = "all"
 			processedKeyword = strings.TrimPrefix(keyword, "#a")
 		}
 
-		// 移除前缀后可能存在的空格
 		processedKeyword = strings.TrimSpace(processedKeyword)
 
-		// 检查是否包含RSS名称限制 (格式: 关键词+rssname)
-		var actualKeyword string
+		// RSS name filter (keyword+FeedName)
+		actualKeyword := processedKeyword
 		var targetRSSName string
 		hasRSSFilter := false
 
 		if strings.Contains(processedKeyword, "+") {
-			parts := strings.Split(processedKeyword, "+")
+			parts := strings.SplitN(processedKeyword, "+", 2)
 			if len(parts) == 2 {
 				actualKeyword = strings.TrimSpace(parts[0])
 				targetRSSName = strings.TrimSpace(parts[1])
 				hasRSSFilter = true
-			} else {
-				actualKeyword = processedKeyword // 如果格式不正确，使用处理后的关键词
-			}
-		} else {
-			actualKeyword = processedKeyword
-		}
-
-		// 如果指定了RSS名称过滤，检查当前RSS是否匹配
-		if hasRSSFilter {
-			if strings.ToLower(rssName) != strings.ToLower(targetRSSName) {
-				continue // RSS名称不匹配，跳过此关键词
 			}
 		}
 
-		// 将关键词转为小写
+		if hasRSSFilter && strings.ToLower(rssName) != strings.ToLower(targetRSSName) {
+			continue // Feed name does not match
+		}
+
 		lowerKeyword := strings.ToLower(actualKeyword)
 
-		// 根据匹配范围选择要匹配的内容
 		var targetContent string
 		switch matchScope {
 		case "title":
@@ -286,18 +275,13 @@ func matchesKeywords(msg Message, keywords []string, rssName string) []string {
 			targetContent = descContent
 		case "all":
 			targetContent = allContent
-		default: // 保持向后兼容，默认只匹配标题
+		default:
 			targetContent = titleContent
 		}
 
-		// 检查是否包含通配符
+		// Wildcard matching via regular expression
 		if strings.Contains(lowerKeyword, "*") {
-			//fmt.Println(lowerKeyword)
-			// 将通配符转换为正则表达式
-			pattern := strings.ReplaceAll(lowerKeyword, "*", ".*")
-			pattern = "^.*" + pattern + ".*$"
-
-			// 编译正则表达式
+			pattern := "^.*" + strings.ReplaceAll(lowerKeyword, "*", ".*") + ".*$"
 			re, err := regexp.Compile(pattern)
 			if err == nil && re.MatchString(targetContent) {
 				if isBlockKeyword {
@@ -309,7 +293,7 @@ func matchesKeywords(msg Message, keywords []string, rssName string) []string {
 			}
 		}
 
-		// 如果没有通配符或正则表达式失败，使用普通匹配
+		// Plain substring matching
 		if strings.Contains(targetContent, lowerKeyword) {
 			if isBlockKeyword {
 				blockedKeywords = append(blockedKeywords, actualKeyword)
@@ -319,9 +303,8 @@ func matchesKeywords(msg Message, keywords []string, rssName string) []string {
 		}
 	}
 
-	// 如果命中任何屏蔽词，则返回空
 	if len(blockedKeywords) > 0 {
-		logMessage("debug", fmt.Sprintf("消息被屏蔽词[%s]过滤: %s",
+		logMessage("debug", fmt.Sprintf("Message blocked by [%s]: %s",
 			strings.Join(blockedKeywords, ", "), msg.Title))
 		return nil
 	}
@@ -329,23 +312,23 @@ func matchesKeywords(msg Message, keywords []string, rssName string) []string {
 	return matchedKeywords
 }
 
-// 处理单个订阅
+// processSubscription fetches new items for sub and delivers matching ones to subscribers.
 func processSubscription(db *sql.DB, sub Subscription, userKeywords map[int64][]string, client *http.Client) {
 	if cyclenum == 0 {
-		logMessage("info", fmt.Sprintf("处理订阅: %s (%s)", sub.Name, sub.URL))
+		logMessage("info", fmt.Sprintf("Processing subscription: %s (%s)", sub.Name, sub.URL))
 	}
+
 	messages, err := fetchRSS(db, sub, client)
 	if err != nil {
-		logMessage("error", fmt.Sprintf("获取RSS失败 %s: %v", sub.Name, err))
+		logMessage("error", fmt.Sprintf("Failed to fetch RSS %s: %v", sub.Name, err))
 		return
 	}
 
 	if len(messages) == 0 {
-		logMessage("debug", fmt.Sprintf("订阅 %s 无新内容", sub.Name))
+		logMessage("debug", fmt.Sprintf("No new items in %s", sub.Name))
 		return
 	}
 
-	// 处理推送
 	pushCount := 0
 	for _, msg := range messages {
 		for _, userID := range sub.Users {
@@ -353,95 +336,86 @@ func processSubscription(db *sql.DB, sub Subscription, userKeywords map[int64][]
 			if len(keywords) == 0 {
 				continue
 			}
+
 			matchedKeywords := matchesKeywords(msg, keywords, sub.Name)
+			if len(matchedKeywords) == 0 {
+				continue
+			}
 
-			// 如果匹配到关键词或是全量推送，则发送消息
-			if len(matchedKeywords) > 0 {
-				pushCount++
-				//if len(matchedKeywords) > 0 {
-				logMessage("debug", fmt.Sprintf("关键词[%s]匹配 推送给用户 %d: %s",
-					strings.Join(matchedKeywords, ", "), userID, msg.Title))
-				// 这里添加实际的推送逻辑
-				recordPush(sub.Name)
-				// 格式化关键词列表，每个关键词单独用code标签包裹
-				var formattedKeywords string
-				if len(matchedKeywords) > 0 {
-					keywordCodes := make([]string, len(matchedKeywords))
-					for i, kw := range matchedKeywords {
-						keywordCodes[i] = fmt.Sprintf("<code>%s</code>", kw)
-					}
-					formattedKeywords = strings.Join(keywordCodes, " ")
-				}
-				title := msg.Title
-				description := msg.Description
-				link := msg.Link
+			pushCount++
+			logMessage("debug", fmt.Sprintf("Keyword(s) [%s] matched — pushing to user %d: %s",
+				strings.Join(matchedKeywords, ", "), userID, msg.Title))
 
-				// 提取图片URL并清理HTML内容
+			recordPush(sub.Name)
 
-				// 格式化时间
-				formattedDate := msg.PubDate.In(time.FixedZone("CST", 8*60*60)).Format("2006-01-02 15:04:05")
-				// 构造HTML消息
-				var htmlMessage, otherpush string
-				if sub.Channel == 1 {
-					imageURL := extractImageURL(description)
-					cleanDescription := cleanHTMLContent(description)
-					htmlMessage = fmt.Sprintf("👋 %s: %s\n🕒 %s\n%s\n", sub.Name, formattedKeywords, formattedDate, cleanDescription)
-					otherpush = fmt.Sprintf("👋 %s\n🕒 %s\n%s", sub.Name, formattedDate, cleanDescription)
-					// 根据是否有图片决定发送方式
-					if imageURL != "" {
-						// 如果找到图片，发送图片消息
-						go sendPhotoMessage(userID, imageURL, htmlMessage)
-					} else {
-						// 如果没有图片，发送普通HTML消息
-						go sendHTMLMessage(userID, htmlMessage)
-					}
+			// Format matched keyword badges
+			keywordCodes := make([]string, len(matchedKeywords))
+			for i, kw := range matchedKeywords {
+				keywordCodes[i] = fmt.Sprintf("<code>%s</code>", kw)
+			}
+			formattedKeywords := strings.Join(keywordCodes, " ")
+
+			// Format publication time in UTC+8
+			formattedDate := msg.PubDate.In(time.FixedZone("UTC+8", 8*60*60)).Format("2006-01-02 15:04:05")
+
+			var htmlMessage, otherpush string
+
+			if sub.Channel == 1 {
+				// Channel mode: include description and optional image
+				imageURL := extractImageURL(msg.Description)
+				cleanDescription := cleanHTMLContent(msg.Description)
+				htmlMessage = fmt.Sprintf("👋 %s: %s\n🕒 %s\n%s\n", sub.Name, formattedKeywords, formattedDate, cleanDescription)
+				otherpush = fmt.Sprintf("👋 %s\n🕒 %s\n%s", sub.Name, formattedDate, cleanDescription)
+				if imageURL != "" {
+					go sendPhotoMessage(userID, imageURL, htmlMessage)
 				} else {
-					htmlMessage = fmt.Sprintf("📌 %s\n🔖 关键词: %s\n🕒 %s\n🔗 %s", title, formattedKeywords, formattedDate, link)
-					otherpush = fmt.Sprintf("📌 %s\n🕒 %s\n🔗 %s", title, formattedDate, link)
 					go sendHTMLMessage(userID, htmlMessage)
 				}
-				if userID == globalConfig.ADMINIDS {
-					go sendother(otherpush)
-				}
+			} else {
+				// Standard mode: title + link
+				htmlMessage = fmt.Sprintf("📌 %s\n🔖 Keywords: %s\n🕒 %s\n🔗 %s",
+					msg.Title, formattedKeywords, formattedDate, msg.Link)
+				otherpush = fmt.Sprintf("📌 %s\n🕒 %s\n🔗 %s", msg.Title, formattedDate, msg.Link)
+				go sendHTMLMessage(userID, htmlMessage)
+			}
+
+			if userID == globalConfig.ADMINIDS {
+				go sendother(otherpush)
 			}
 		}
 	}
-	logMessage("info", fmt.Sprintf("订阅 %s 完成，推送 %d 条消息", sub.Name, pushCount))
+
+	logMessage("info", fmt.Sprintf("Subscription %s done — %d item(s) pushed", sub.Name, pushCount))
 }
 
-// 检查所有RSS订阅
-func checkAllRSS(db *sql.DB) {
-	db, err := sql.Open("sqlite3", "tgbot.db")
-	if err != nil {
-		logMessage("error", fmt.Sprintf("连接数据库失败: %v", err))
-		os.Exit(1)
-	}
-	defer db.Close()
+// checkAllRSS is called on each ticker tick.
+// It reuses the global db connection passed in from startRSSMonitor instead
+// of opening a fresh connection on every cycle.
+func checkAllRSS() {
 	startTime := time.Now()
 	resetPushStatsIfNeeded()
-	logMessage("info", "开始检查RSS订阅...")
+	logMessage("info", "Checking RSS subscriptions...")
 
-	// 获取数据
 	subscriptions, err := getSubscriptions(db)
 	if err != nil {
-		logMessage("error", fmt.Sprintf("获取订阅失败: %v", err))
+		logMessage("error", fmt.Sprintf("Failed to load subscriptions: %v", err))
 		return
 	}
 
 	if len(subscriptions) == 0 {
-		logMessage("info", "没有找到RSS订阅")
+		logMessage("info", "No RSS subscriptions found.")
 		return
 	}
 
 	userKeywords, err := getUserKeywords(db)
 	if err != nil {
-		logMessage("error", fmt.Sprintf("获取用户关键词失败: %v", err))
+		logMessage("error", fmt.Sprintf("Failed to load user keywords: %v", err))
 		return
 	}
 
 	client := createHTTPClient(globalConfig.ProxyURL)
 
-	// 并发处理订阅
+	// Process all subscriptions concurrently
 	var wg sync.WaitGroup
 	for _, sub := range subscriptions {
 		wg.Add(1)
@@ -452,101 +426,78 @@ func checkAllRSS(db *sql.DB) {
 	}
 
 	wg.Wait()
-	logMessage("info", fmt.Sprintf("RSS检查完成，耗时: %v", time.Since(startTime)))
+	logMessage("info", fmt.Sprintf("RSS check complete — elapsed: %v", time.Since(startTime)))
 	cyclenum = 1
-	// 打印当前的推送统计
-	//stats := GetPushStatsInfo()
-	//if DailyPushStats.TotalPush > 0 {
-	//	logMessage("info", stats)
-	//}
 }
 
-// extractImageURL 从HTML内容中提取第一个图片URL
+// extractImageURL searches htmlContent for the first image URL.
+// It tries (in order): <img src="…">, bare image file URLs, Telegram CDN URLs.
 func extractImageURL(htmlContent string) string {
-	// 1. 正则表达式匹配img标签的src属性
 	imgRegex := regexp.MustCompile(`<img[^>]+src=["']([^"']+)["']`)
-	matches := imgRegex.FindStringSubmatch(htmlContent)
-
-	if len(matches) > 1 {
-		return matches[1] // 返回第一个捕获组（图片URL）
+	if matches := imgRegex.FindStringSubmatch(htmlContent); len(matches) > 1 {
+		return matches[1]
 	}
 
-	// 2. 尝试在文本中直接寻找图片URL（.jpg, .png, .gif等格式）
 	urlRegex := regexp.MustCompile(`https?://[^\s"']+\.(jpg|jpeg|png|gif|webp)`)
-	urlMatches := urlRegex.FindString(htmlContent)
-
-	if urlMatches != "" {
-		return urlMatches
+	if m := urlRegex.FindString(htmlContent); m != "" {
+		return m
 	}
 
-	// 3. 检查Telegram CDN链接
 	cdnRegex := regexp.MustCompile(`https?://cdn[0-9]*\.cdn-telegram\.org/[^\s"']+`)
-	cdnMatches := cdnRegex.FindString(htmlContent)
-
-	if cdnMatches != "" {
-		return cdnMatches
+	if m := cdnRegex.FindString(htmlContent); m != "" {
+		return m
 	}
 
-	// 没有找到图片，返回空字符串
 	return ""
 }
 
-// cleanHTMLContent 清理HTML内容，移除Telegram不支持的标签
+// cleanHTMLContent strips HTML tags that Telegram does not support while
+// preserving the subset it does: <b>, <i>, <u>, <s>, <code>, <pre>, <a>.
 func cleanHTMLContent(htmlContent string) string {
-	// 1. 移除img标签，但保留其它内容
-	imgRegex := regexp.MustCompile(`<img[^>]*>`)
-	content := imgRegex.ReplaceAllString(htmlContent, "")
+	// Remove <img> tags
+	content := regexp.MustCompile(`<img[^>]*>`).ReplaceAllString(htmlContent, "")
 
-	// 2. 替换<br>标签为换行符
-	brRegex := regexp.MustCompile(`<br\s*\/?>`)
-	content = brRegex.ReplaceAllString(content, "\n")
+	// Convert <br> to newline
+	content = regexp.MustCompile(`<br\s*\/?>` ).ReplaceAllString(content, "\n")
 
-	// 3. 保留Telegram支持的标签，移除其他标签
-	// Telegram支持的标签: <b>, <i>, <u>, <s>, <a>, <code>, <pre>
-	// 我们采用分步骤处理的方式
+	// Temporarily encode supported tags so they survive the strip step
+	replacements := [][2]string{
+		{"<b>", "§§§B§§§"}, {"</b>", "§§§/B§§§"},
+		{"<i>", "§§§I§§§"}, {"</i>", "§§§/I§§§"},
+		{"<u>", "§§§U§§§"}, {"</u>", "§§§/U§§§"},
+		{"<s>", "§§§S§§§"}, {"</s>", "§§§/S§§§"},
+		{"<code>", "§§§CODE§§§"}, {"</code>", "§§§/CODE§§§"},
+		{"<pre>", "§§§PRE§§§"}, {"</pre>", "§§§/PRE§§§"},
+	}
+	for _, r := range replacements {
+		content = regexp.MustCompile(regexp.QuoteMeta(r[0])).ReplaceAllString(content, r[1])
+	}
 
-	// 暂时标记支持的标签，以便后面恢复
-	content = regexp.MustCompile(`<b>`).ReplaceAllString(content, "§§§B§§§")
-	content = regexp.MustCompile(`</b>`).ReplaceAllString(content, "§§§/B§§§")
-	content = regexp.MustCompile(`<i>`).ReplaceAllString(content, "§§§I§§§")
-	content = regexp.MustCompile(`</i>`).ReplaceAllString(content, "§§§/I§§§")
-	content = regexp.MustCompile(`<u>`).ReplaceAllString(content, "§§§U§§§")
-	content = regexp.MustCompile(`</u>`).ReplaceAllString(content, "§§§/U§§§")
-	content = regexp.MustCompile(`<s>`).ReplaceAllString(content, "§§§S§§§")
-	content = regexp.MustCompile(`</s>`).ReplaceAllString(content, "§§§/S§§§")
-	content = regexp.MustCompile(`<code>`).ReplaceAllString(content, "§§§CODE§§§")
-	content = regexp.MustCompile(`</code>`).ReplaceAllString(content, "§§§/CODE§§§")
-	content = regexp.MustCompile(`<pre>`).ReplaceAllString(content, "§§§PRE§§§")
-	content = regexp.MustCompile(`</pre>`).ReplaceAllString(content, "§§§/PRE§§§")
-
-	// 特殊处理a标签
-	aTagRegex := regexp.MustCompile(`<a\s+href=["']([^"']+)["'][^>]*>`)
-	content = aTagRegex.ReplaceAllString(content, "§§§A§§§$1§§§")
+	// Encode <a href="…"> specially
+	content = regexp.MustCompile(`<a\s+href=["']([^"']+)["'][^>]*>`).
+		ReplaceAllString(content, "§§§A§§§$1§§§")
 	content = regexp.MustCompile(`</a>`).ReplaceAllString(content, "§§§/A§§§")
 
-	// 移除所有剩余的HTML标签
-	allTagsRegex := regexp.MustCompile(`<[^>]*>`)
-	content = allTagsRegex.ReplaceAllString(content, "")
+	// Strip all remaining HTML tags
+	content = regexp.MustCompile(`<[^>]*>`).ReplaceAllString(content, "")
 
-	// 恢复支持的标签
-	content = regexp.MustCompile(`§§§B§§§`).ReplaceAllString(content, "<b>")
-	content = regexp.MustCompile(`§§§/B§§§`).ReplaceAllString(content, "</b>")
-	content = regexp.MustCompile(`§§§I§§§`).ReplaceAllString(content, "<i>")
-	content = regexp.MustCompile(`§§§/I§§§`).ReplaceAllString(content, "</i>")
-	content = regexp.MustCompile(`§§§U§§§`).ReplaceAllString(content, "<u>")
-	content = regexp.MustCompile(`§§§/U§§§`).ReplaceAllString(content, "</u>")
-	content = regexp.MustCompile(`§§§S§§§`).ReplaceAllString(content, "<s>")
-	content = regexp.MustCompile(`§§§/S§§§`).ReplaceAllString(content, "</s>")
-	content = regexp.MustCompile(`§§§CODE§§§`).ReplaceAllString(content, "<code>")
-	content = regexp.MustCompile(`§§§/CODE§§§`).ReplaceAllString(content, "</code>")
-	content = regexp.MustCompile(`§§§PRE§§§`).ReplaceAllString(content, "<pre>")
-	content = regexp.MustCompile(`§§§/PRE§§§`).ReplaceAllString(content, "</pre>")
+	// Restore supported tags
+	restores := [][2]string{
+		{"§§§B§§§", "<b>"}, {"§§§/B§§§", "</b>"},
+		{"§§§I§§§", "<i>"}, {"§§§/I§§§", "</i>"},
+		{"§§§U§§§", "<u>"}, {"§§§/U§§§", "</u>"},
+		{"§§§S§§§", "<s>"}, {"§§§/S§§§", "</s>"},
+		{"§§§CODE§§§", "<code>"}, {"§§§/CODE§§§", "</code>"},
+		{"§§§PRE§§§", "<pre>"}, {"§§§/PRE§§§", "</pre>"},
+	}
+	for _, r := range restores {
+		content = regexp.MustCompile(regexp.QuoteMeta(r[0])).ReplaceAllString(content, r[1])
+	}
 	content = regexp.MustCompile(`§§§A§§§(.*?)§§§`).ReplaceAllString(content, `<a href="$1">`)
 	content = regexp.MustCompile(`§§§/A§§§`).ReplaceAllString(content, "</a>")
 
-	// 4. 移除连续的换行符
-	multipleNewlinesRegex := regexp.MustCompile(`\n{3,}`)
-	content = multipleNewlinesRegex.ReplaceAllString(content, "\n\n")
+	// Collapse runs of three or more newlines
+	content = regexp.MustCompile(`\n{3,}`).ReplaceAllString(content, "\n\n")
 
 	return content
 }
