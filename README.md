@@ -8,7 +8,7 @@
         \/         \/_____/      \/             \/      \/                  \/ 
 ```
 A lightweight Go-based **Telegram bot–based RSS/Atom multi-feed reader**
-	
+https://github.com/SiegerExtra/TGBot_RSS
 
 ## Features
 - `Keyword/Exclusion/multiWildcard` filters
@@ -26,7 +26,7 @@ A lightweight Go-based **Telegram bot–based RSS/Atom multi-feed reader**
 - Daily statistics
 
 ### Origin
-Forked from *notoriously* `CN-only-interface` app/code by AbBai @ github.com/IonRh/TGBot_RSS
+Forked from *notoriously* `CN-only-interface` app/code by AbBai @ github.com/IonRh/TGBot_RSS\
 *-> because you know, not everyone of us are CN yet, so we've dealt with the original code in a better way =)*
 
 ## Quick Start
@@ -80,6 +80,17 @@ Matching is `case-insensitive`
 
 ## ChangeLog
 
+`v1.0.8`
+- Added `subscriptions multi-adding`, similar to `keywords multi-adding`.
+		Uses same separation syntax: *one subscription per text line*;
+-	Added commands
+	- `/removeSubscriptions` or `/rs` or `/rf`
+	- `/removeKeywords` or `/rk`
+	to reset/drop all subscriptions/keywords for current/calling user;
+- Changed original-code `SendError()` to return `HTML output`, instead of *plain-text*;
+- For `RSSpollDelay`, added a *dynamic random delay range* `RSSpollDelay/4-RSSpollDelay` for each RSS poll,
+	when RSSpollDelay is set to ``5 sec`` or more;
+---
 `v1.0.7`
 - Added `throttling of Telegram message pushing` via `config.json\TGmsgDelay`,
 	to prevent Telegram service overuse resulting in potential bot-throttling/ban
@@ -118,5 +129,5 @@ Matching is `case-insensitive`
 ## Disclaimer
 - Any textual artefacts that *may appear* to be of `trolling` context, were never intended to be so,
 	and thus are purely a subject of imaginative personal interpretation `=)`
-- All rights are reserved to their respective owners, *except when they are not*,
+- All rights are reserved to their respective owners, *except when they are not*,\
 	according to included Boost Software License - Version 1.0 - August 17th, 2003

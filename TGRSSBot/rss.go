@@ -18,6 +18,8 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mmcdole/gofeed"
+
+	"math/rand"
 )
 
 // getSubscriptions returns all RSS subscriptions from the database.
@@ -413,7 +415,7 @@ func processSubscription(db *sql.DB, sub Subscription, userKeywords map[int64][]
 func checkAllRSS() {
     startTime := time.Now()
     resetPushStatsIfNeeded()
-    logMessage("info", fmt.Sprintf("RSS reader: polling subscriptions now. Entire subscription-pool is polled every %d min, while using %d sec delay between each single feed polling", globalConfig.Cycletime, globalConfig.RSSpollDelay))
+    logMessage("info", fmt.Sprintf("RSS reader: polling subscriptions now. Entire subscription-pool is polled every %d min, while using max %d sec delay between each single feed polling", globalConfig.Cycletime, globalConfig.RSSpollDelay))
 
     subscriptions, err := getSubscriptions(db)
     if err != nil {
@@ -449,7 +451,19 @@ func checkAllRSS() {
         // Sequential processing with delay, to prevent target services overuse/bans
         for _, sub := range subscriptions {
             processSubscription(db, sub, userKeywords, client)
-            time.Sleep(time.Duration(globalConfig.RSSpollDelay) * time.Second)
+
+            // Randomize delay if RSSpollDelay >= 5
+            delay := globalConfig.RSSpollDelay
+            strRandomDelay := "fixed"
+            if delay >= 5 {
+                // Random between delay/4 and delay
+                minDelay := delay / 4
+                rand.Seed(time.Now().UnixNano())
+                delay = minDelay + rand.Intn(delay-minDelay+1)
+                strRandomDelay = "random"
+            }
+            logMessage("debug", fmt.Sprintf("RSS single poll complete, adding a %s delay of %v sec", strRandomDelay, delay))
+            time.Sleep(time.Duration(delay) * time.Second)
         }
     }
 

@@ -4,6 +4,17 @@ TGBot_RSS/SiegerExtra @ github.com/SiegerExtra/TGBot_RSS
 	-> because you know, not everyone of us are CN yet, so we've dealt with the original code in a better way =)
 
 ChangeLog:
+v1.0.8
+	Added subscriptions multi-adding, similar to keywords multi-adding.
+		Uses same separation syntax: one subscription per text line;
+	Added commands
+		/removeSubscriptions /rs /rf
+		/removeKeywords /rk
+	to reset/drop all subscriptions/keywords for current/calling user;
+	Changed original-code SendError() to return HTML output instead of plain-text;
+	For RSSpollDelay, added a dynamic random delay range RSSpollDelay/4-RSSpollDelay for each RSS poll,
+		when RSSpollDelay is set to 5 sec or more;
+
 v1.0.7
 	Added throttling of Telegram message pushing via config.json\TGmsgDelay,
 		to prevent Telegram service overuse resulting in potential bot-throttling/ban;
@@ -496,7 +507,7 @@ func (m *MessageSender) SendHTMLResponse(userID int64, messageID int, text strin
 // SendError sends an error message with a back-to-menu button.
 func (m *MessageSender) SendError(userID int64, messageID int, errorText string) {
 	keyboard := CreateBackButton()
-	if err := m.SendResponse(userID, messageID, errorText, &keyboard); err != nil {
+	if err := m.SendHTMLResponse(userID, messageID, errorText, &keyboard); err != nil {
 		logMessage("error", fmt.Sprintf("Failed to send error message: %v", err), userID)
 	}
 }
@@ -684,23 +695,32 @@ func (h *UserActionHandler) handleSubscriptionAction(userID int64, messageID int
 	switch action {
 	case "add_prompt":
 		setUserState(userID, "add_subscription", messageID, nil)
-		text := "✏️ Add a new subscription manually:\n" +
+		text := "✏️ Add new subscription(s) manually:\n" +
 			"⚠️ Channels must be converted to RSS before adding.\n" +
 			"Enter subscription details in this format:\n\n" +
 			"URL Name ChannelMode\n\n" +
 			"📝 Examples:\n" +
 			"Regular:  https://example.com/feed TechNews 0\n" +
-			"Channel:  https://example.com/channel/feed TGUpdates 1"
+			"Channel:  https://example.com/channel/feed TGUpdates 1\n\n" +
+			"💡 To add multiple subscriptions at once, enter each on a new line:\n" +
+			"https://example.com/feed1 TechNews 0\n" +
+			"https://example.com/feed2 TGUpdates 1\n" +
+			"https://example.com/feed3 DevBlog 0"
 		keyboard := CreateBackButton()
 		h.sender.SendResponse(userID, messageID, text, &keyboard)
 
 	case "add":
+		// For backwards compatibility, handle as single subscription
 		if len(data) < 3 {
 			h.sender.SendError(userID, messageID,
-				"❌ Format error! Please use:\nURL Name ChannelMode\nExample: https://example.com/feed TechNews 0")
+				"❌ Format error! Please use:\nURL Name ChannelMode\nExample: https://example.com/feed TechNews 0\n\n"+
+				"Or add multiple subscriptions, one per line:\n"+
+				"https://example.com/feed1 TechNews 0\n"+
+				"https://example.com/feed2 TGUpdates 1")
 			return
 		}
-		h.addSubscription(userID, messageID, data[0], data[1], data[2])
+		// Process as a single subscription
+		processSubscriptions(userID, messageID, []string{fmt.Sprintf("%s %s %s", data[0], data[1], data[2])})
 
 	case "view":
 		h.viewSubscriptions(userID, messageID)
@@ -803,22 +823,8 @@ func (h *UserActionHandler) deleteKeyword(userID int64, messageID int, keyword s
 // Subscription operations
 // ---------------------------------------------------------------------------
 
-func (h *UserActionHandler) addSubscription(userID int64, messageID int, feedURL, name, channel string) {
-	feedURL = strings.TrimSpace(feedURL)
-	name = strings.TrimSpace(name)
-
-	if err := validateAndProcessSubscription(feedURL, name, channel, userID); err != nil {
-		logMessage("error", fmt.Sprintf("Failed to add subscription: %v", err), userID)
-		h.sender.SendError(userID, messageID, "❌ "+err.Error())
-		return
-	}
-
-	clearUserState(userID)
-	keyboard := CreateBackButton()
-	text := fmt.Sprintf("✅ Subscription added:\n📰 %s\n🔗 %s", name, feedURL)
-	logMessage("info", fmt.Sprintf("✅ Subscription added: 📰 %s  🔗 %s", name, feedURL))
-	h.sender.SendResponse(userID, messageID, text, &keyboard)
-}
+// This method is now deprecated, in favor of multi-add-subscriptoions flow via processSubscriptions.
+//func (h *UserActionHandler) addSubscription(userID int64, messageID int, feedURL, name, channel string) {}
 
 func (h *UserActionHandler) viewSubscriptions(userID int64, messageID int) {
 	subscriptions, err := getSubscriptionsForUser(userID)
@@ -1167,17 +1173,115 @@ func handleKeywordInput(message *tgbotapi.Message) {
 }
 
 // handleSubscriptionInput processes free-text subscription input from the user.
+// Supports multi-line input: each line with "URL Name ChannelMode" format.
+// Handles both \n and \r\n line endings.
 func handleSubscriptionInput(message *tgbotapi.Message) {
 	userID := message.From.ID
-	parts := strings.SplitN(strings.TrimSpace(message.Text), " ", 3)
-
-	if len(parts) != 3 {
-		messageSender.SendError(userID, 0,
-			"❌ Format error! Please use:\nURL Name ChannelMode\nExample: https://example.com/feed TechNews 0")
+	text := strings.TrimSpace(message.Text)
+	if text == "" {
+		messageSender.SendError(userID, 0, "❌ Please enter valid subscription details.")
 		return
 	}
 
-	actionHandler.HandleAction(userID, 0, "subscription", "add", parts[0], parts[1], parts[2])
+	strWrongFormat := "⚠️ Invalid format\n<code>%s</code>\nUse:\nURL FeedName ChannelMode\n\n"+
+				"To add multiple subscriptions, use one subscription per line:\n"+
+				"<code>https://example.com/feed1 TechNews 0\n"+
+				"https://example.com/feed2 TGUpdates 1</code>"
+
+	var subscriptions []string
+	var errors []string
+
+	// Split by newline (multi-line input) - handles both \n and \r\n
+	lines := strings.Split(text, "\n")
+	
+	// Check if we have multiple lines or just one
+	if len(lines) > 1 {
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			line = strings.TrimSuffix(line, "\r") // Handle Windows \r\n
+			if line == "" {
+				continue
+			}
+			// Each line should have 3 parts: URL Name ChannelMode
+			parts := strings.Fields(line)
+			if len(parts) < 3 {
+				errors = append(errors, fmt.Sprintf(strWrongFormat, line))
+				continue
+			}
+			subscriptions = append(subscriptions, line)
+		}
+	} else {
+		// Single line: treat as one subscription
+		parts := strings.Fields(text)
+		if len(parts) < 3 {
+			messageSender.SendError(userID, 0, fmt.Sprintf(strWrongFormat, text))
+			return
+		}
+		subscriptions = append(subscriptions, text)
+	}
+
+	if len(subscriptions) == 0 && len(errors) > 0 {
+		messageSender.SendError(userID, 0, fmt.Sprintf("❌ No valid subscriptions found:\n<code>%s</code>", strings.Join(errors, "\n")))
+		return
+	}
+
+	if len(errors) > 0 && len(subscriptions) > 0 {
+		// Some succeeded, some failed — inform user and proceed with valid ones
+		msg := fmt.Sprintf("⚠️ Some subscriptions had errors:\n%s\n\n", strings.Join(errors, "\n"))
+		// Process the valid ones
+		processSubscriptions(userID, 0, subscriptions)
+		sendHTMLMessage(userID, msg)
+		return
+	}
+
+	processSubscriptions(userID, 0, subscriptions)
+}
+
+// processSubscriptions handles adding multiple subscriptions for a user.
+func processSubscriptions(userID int64, messageID int, subscriptionLines []string) {
+	var successCount int
+	var failedCount int
+	var successDetails []string
+	var failedDetails []string
+
+	for _, line := range subscriptionLines {
+		parts := strings.Fields(line)
+		if len(parts) < 3 {
+			failedCount++
+			failedDetails = append(failedDetails, fmt.Sprintf("❌ Invalid format: '%s'", line))
+			continue
+		}
+
+		feedURL := parts[0]
+		name := parts[1]
+		channel := parts[2]
+
+		err := validateAndProcessSubscription(feedURL, name, channel, userID)
+		if err != nil {
+			failedCount++
+			failedDetails = append(failedDetails, fmt.Sprintf("❌ %s: %v", name, err))
+		} else {
+			successCount++
+			successDetails = append(successDetails, fmt.Sprintf("✅ %s (%s)", name, feedURL))
+			logMessage("info", fmt.Sprintf("✅ Subscription added: 📰 %s  🔗 %s", name, feedURL))
+		}
+	}
+
+	clearUserState(userID)
+	keyboard := CreateBackButton()
+
+	var resultText string
+	strSkippedSubscr := "⚠️ Skipped %d subscription(s):\n%s"
+	if successCount > 0 && failedCount == 0 {
+		resultText = fmt.Sprintf("✅ Added %d subscription(s):\n\n%s", successCount, strings.Join(successDetails, "\n"))
+	} else if successCount > 0 && failedCount > 0 {
+		resultText = fmt.Sprintf("✅ Added %d subscription(s):\n%s\n\n"+strSkippedSubscr,
+			successCount, strings.Join(successDetails, "\n"), failedCount, strings.Join(failedDetails, "\n"))
+	} else {
+		resultText = fmt.Sprintf(strSkippedSubscr, failedCount, strings.Join(failedDetails, "\n"))
+	}
+
+	messageSender.SendResponse(userID, messageID, resultText, &keyboard)
 }
 
 // showMainMenu sends the main menu to userID.
@@ -1217,6 +1321,8 @@ func showHelp(userID int64, messageID int) {
 <code>/help /h</code> displays this Help
 <code>/version /v</code> displays version of this bot
 <code>/resetLastUpdateTime /r $days[1-99]</code> resets feeds last update timeStamp, allowing quickly re-match feeds for setup/debug
+<code>/resetSubscriptions /rs /rf</code> resets ALL your subscriptions
+<code>/resetKeywords /rk</code> resets ALL your keywords
 
 🔤 <b>Basic keywords</b>
 • Supports any language; separate multiple keywords with #!#
@@ -1262,7 +1368,9 @@ func resetLastUpdateTime(userID int64, days int) {
     // Construct the SQLite datetime expression
     sqlExpr := fmt.Sprintf("datetime('now', '-%d days', 'start of day')", days)
 
-    // Get all subscription names for this user
+    // Get all subscription names for this user:
+    // resetLastUpdateTime needs to update 'feed_data' which only has 'rss_name', not 'user_id',
+    // so it's necessary get the subscription names first to know which 'feed_data' rows to update
     subscriptions, err := getSubscriptionsForUser(userID)
     if err != nil {
         logMessage("error", fmt.Sprintf("Failed to get user subscriptions: %v", err), userID)
@@ -1315,6 +1423,66 @@ func resetLastUpdateTime(userID int64, days int) {
     checkAllRSS()
 }
 
+// resetSubscriptions removes all subscriptions for the calling user.
+func resetSubscriptions(userID int64) {
+    // First, get subscription names to delete from feed_data
+    subscriptions, err := getSubscriptionsForUser(userID)
+    if err != nil {
+        logMessage("error", fmt.Sprintf("Failed to get user subscriptions: %v", err), userID)
+        sendMessage(userID, "❌ Failed to reset subscriptions.")
+        return
+    }
+
+    if len(subscriptions) == 0 {
+        sendMessage(userID, "ℹ️ You have no subscriptions to reset.")
+        return
+    }
+
+    // Delete from subscriptions
+    result, err := db.Exec("DELETE FROM subscriptions WHERE users LIKE ?", "%"+strconv.FormatInt(userID, 10)+"%")
+    if err != nil {
+        logMessage("error", fmt.Sprintf("Failed to reset subscriptions: %v", err), userID)
+        sendMessage(userID, "❌ Failed to reset subscriptions.")
+        return
+    }
+
+    count, _ := result.RowsAffected()
+
+    // Delete corresponding feed_data entries
+    var names []string
+    for _, sub := range subscriptions {
+        names = append(names, sub.Name)
+    }
+
+    placeholders := strings.Repeat("?,", len(names))
+    placeholders = placeholders[:len(placeholders)-1]
+
+    args := make([]interface{}, len(names))
+    for i, name := range names {
+        args[i] = name
+    }
+
+    _, err = db.Exec("DELETE FROM feed_data WHERE rss_name IN ("+placeholders+")", args...)
+    if err != nil {
+        logMessage("error", fmt.Sprintf("Failed to reset feed_data: %v", err), userID)
+        // Still report subscriptions deleted, but log the error
+    }
+
+    sendMessage(userID, fmt.Sprintf("✅ Reset %d subscription(s).", count))
+}
+
+// resetKeywords removes all keywords for the calling user.
+func resetKeywords(userID int64) {
+    _, err := db.Exec("DELETE FROM user_keywords WHERE user_id = ?", userID)
+    if err != nil {
+        logMessage("error", fmt.Sprintf("Failed to reset keywords: %v", err), userID)
+        sendMessage(userID, "❌ Failed to reset keywords.")
+        return
+    }
+
+    sendMessage(userID, "✅ Reset all keywords for your user.")
+}
+
 // handleCommand dispatches bot commands (e.g. /start, /help).
 func handleCommand(message *tgbotapi.Message) {
 	userID := message.From.ID
@@ -1348,18 +1516,18 @@ func handleCommand(message *tgbotapi.Message) {
 		versionMsg := fmt.Sprintf(
 			"🤖TGBot_RSS/SiegerExtra\n"+
 				" Version: %s\n"+
-				" Build: %s\n"+
-				" 📦https://github.com/SiegerExtra/TGBot_RSS",
+				" Build: %s\n\n"+
+				"📦https://github.com/SiegerExtra/TGBot_RSS",
 			version, buildTime)
 		sendMessage(userID, versionMsg)
 
-	case "resetlastupdatetime", "r": // resetLastUpdateTime
+	case "resetlastupdatetime", "r": //resetLastUpdateTime
         var days int
     	var err error
         
         if args == "" {
         	days = 1
-            sendMessage(userID, "✅ No args supplied for the command,\nperforming default /resetLastUpdateTime 1")
+            sendMessage(userID, "✅ No args supplied for the command, performing default\n/resetLastUpdateTime 1")
         } else {
         	days, err = strconv.Atoi(args)
         }
@@ -1370,6 +1538,12 @@ func handleCommand(message *tgbotapi.Message) {
         }
         
         resetLastUpdateTime(userID, days)
+
+    case "resetsubscriptions", "rs", "rf": //resetSubscriptions
+    	resetSubscriptions(userID)
+
+	case "resetkeywords", "rk": //resetKeywords
+    	resetKeywords(userID)
 
 	default:
 		sendMessage(userID, fmt.Sprintf("Unknown command: %s\nUse /start for the menu or /help for assistance.", command))
@@ -1900,7 +2074,7 @@ func validateAndProcessSubscription(feedURL, name, channel string, userID int64)
 
 			for _, uid := range existingUsers {
 				if uid == userID {
-					return fmt.Errorf("you are already subscribed to this RSS feed")
+					return fmt.Errorf("(already subscribed)")
 				}
 			}
 
