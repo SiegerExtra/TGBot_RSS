@@ -5,5 +5,7 @@
   "Debug": true,
   "ProxyURL": "",
   "Pushinfo": "",
-  "TimeZone": "Asia/Riyadh"
+  "TimeZone": "Asia/Riyadh",
+  "RSSpollDelay": 1,
+  "TGmsgDelay": 35
 }

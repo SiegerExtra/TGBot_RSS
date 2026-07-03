@@ -1,16 +1,33 @@
 /*
 TGBot_RSS/SiegerExtra @ github.com/SiegerExtra/TGBot_RSS
-	Forked from notoriously CN-only interface app/code by AbBai @ github.com/IonRh/TGBot_RSS
-	-> because you know, not all of us are from CN, and thus unwilling to tolerate it =)
+	Forked from notoriously CN-only-interface app/code by AbBai @ github.com/IonRh/TGBot_RSS
+	-> because you know, not everyone of us are CN yet, so we've dealt with the original code in a better way =)
 
-Changelog:
+ChangeLog:
+v1.0.7
+	Added throttling of Telegram message pushing via config.json\TGmsgDelay,
+		to prevent Telegram service overuse resulting in potential bot-throttling/ban;
+	Added throttling of RSS/Atom feeds polling via config.json\RSSpollDelay,
+		to prevent RSS services overuse resulting in potential throttling/bans;
+	Added chat command /resetLastUpdateTime -> /r $days[1-99] resets feeds last update timeStamp,
+		allowing quickly re-match feeds for setup/debug. Affects all feeds for calling TG user only;
+	Changed keyword separator to a most natural one: newLine char (both /n and /r/n are supported);
+	Changed original minced keyword list output to be one-keyword-per-line, and in monospace font;
+	Added alises for /start -> /s, /help -> /h chat commands;
+	Added chat command /version -> /v;
+	Changed TG messages for Add/Delete Keyword to Telegram.HTML output format;
+	Explicitly restricted keyword length to max 57 bytes (also consider Unicode),
+		since original code passes keywords via Telegram callback (max 64 bytes) using 'del_kw_'+keyword string.
+		Without such restriction, adding a keyword >57 bytes causes `Delete Keyword` menu to become inoperational,
+		until lengthy keywords get removed manually/scripted from the database;
+
 v1.0.6
 	Changed standart mode output to also include subscription/feed name;
 	Changed original fixed CN-timeZone to be instead configurable via config.json\TimeZone;
 
 v1.0.5
 	Elaborated keywords to allow for spaces, e.g. 'key word';
-	Changed original keywords separator from ','' to '#!#';
+	Changed original keyword separator from excessively-encountered ',' to '#!#';
 
 v1.0.4
 	Fully replaced all CN-strings with EN-strings;
@@ -33,6 +50,7 @@ $env:GOOS = "linux"; $env:GOARCH = "amd64"; $env:CGO_ENABLED="1"; $env:CC = "zig
 
 Alternatively, to use pure-Go SQLite drivers, like modernc.org/sqlite or github.com/ncruces/go-sqlite3
 */
+
 /*
 Versioning samples:
 -ldflags "-X main.version=v1.2.3 -X main.buildTime=$(date -u +%F) -X main.gitCommit=$(git rev-parse --short HEAD)"
@@ -73,13 +91,15 @@ var (
 
 // Config holds application configuration loaded from config.json.
 type Config struct {
-	BotToken  string `json:"BotToken"`  // Telegram Bot API token
-	ADMINIDS  int64  `json:"ADMINIDS"`  // Administrator user ID
-	Cycletime int    `json:"Cycletime"` // RSS check interval (minutes)
-	Debug     bool   `json:"Debug"`     // Enable debug logging
-	ProxyURL  string `json:"ProxyURL"`  // Optional proxy server URL
-	Pushinfo  string `json:"Pushinfo"`  // Push notification endpoint template
-	TimeZone  string `json:"TimeZone"`  // IANA timezone name, e.g. "Asia/Riyadh"
+	BotToken		string `json:"BotToken"`  // Telegram Bot API token
+	ADMINIDS		int64  `json:"ADMINIDS"`  // Administrator user ID
+	Cycletime		int    `json:"Cycletime"` // RSS check interval (minutes)
+	Debug			bool   `json:"Debug"`     // Enable debug logging
+	ProxyURL		string `json:"ProxyURL"`  // Optional proxy server URL
+	Pushinfo		string `json:"Pushinfo"`  // Push notification endpoint template
+	TimeZone		string `json:"TimeZone"`  // IANA timezone name, e.g. "Asia/Riyadh"
+	RSSpollDelay	int    `json:"RSSpollDelay"` // Seconds delay between RSS polls
+	TGmsgDelay   	int    `json:"TGmsgDelay"`   // Milliseconds delay between Telegram messages
 }
 
 // Message holds a parsed RSS feed entry.
@@ -138,7 +158,19 @@ const (
 	LogFile          = "bot.log"        // Path to the log file
 	DBFile           = "tgbot.db"       // Path to the SQLite database file
 	ConfigFile       = "config.json"    // Path to the configuration file
-	DefaultCycleTime = 300              // Default RSS check interval in seconds
+	DefaultCycleTime = 300              // Default overall RSS check cycle in seconds
+	DefaultRSSpollMinDelay = 0			// Default RSS poll min delay interval in seconds
+	DefaultRSSpollMaxDelay = 60			// Default RSS poll max delay interval in seconds
+	DefaultTGmsgDelay = 35				// Default delay between Telegram messages
+										// to prevent TG-overuse/bot-restrictions/throttling via HTTP429 Too Many Requests
+    MaxTGmsgDelay = 2000				// Max delay between Telegram messages
+
+	// Timestamp format constants
+	DateFormat = "2006-01-02"
+    TimeStampFormat = "2006-01-02 15:04:05"
+    TimeZoneFormat = "-07"
+
+    MaxKeywordLength = 57 // Max 57 bytes for Telegram callback, which is used to pass whole keyword string, in original source code by AbBai
 )
 
 // PushStats tracks daily push notification counts.
@@ -151,7 +183,7 @@ type PushStats struct {
 
 // DailyPushStats is the global daily counter, reset at midnight.
 var DailyPushStats = &PushStats{
-	Date:  time.Now().Format("2006-01-02"),
+	Date:  time.Now().Format(DateFormat),
 	ByRSS: make(map[string]int),
 }
 
@@ -165,7 +197,7 @@ func resetPushStatsIfNeeded() {
 	DailyPushStats.mutex.Lock()
 	defer DailyPushStats.mutex.Unlock()
 
-	currentDate := time.Now().Format("2006-01-02")
+	currentDate := time.Now().Format(DateFormat)
 	if DailyPushStats.Date != currentDate {
 		if DailyPushStats.TotalPush > 0 {
 			logMessage("info", fmt.Sprintf("Date changed — %s push summary: %d total. Counters reset.",
@@ -182,7 +214,7 @@ func recordPush(rssName string) {
 	DailyPushStats.mutex.Lock()
 	defer DailyPushStats.mutex.Unlock()
 
-	currentDate := time.Now().Format("2006-01-02")
+	currentDate := time.Now().Format(DateFormat)
 	if DailyPushStats.Date != currentDate {
 		DailyPushStats.Date = currentDate
 		DailyPushStats.TotalPush = 0
@@ -232,6 +264,22 @@ func loadConfig() (*Config, error) {
 		config.Cycletime = DefaultCycleTime
 	}
 
+	// Delay between each RSS poll, min 0 sec (concurrent polls via goroutines), max DefaultRSSpollMaxDelay sec
+	if config.RSSpollDelay < DefaultRSSpollMinDelay {
+	    config.RSSpollDelay = DefaultRSSpollMinDelay
+	}
+	if config.RSSpollDelay > DefaultRSSpollMaxDelay {
+	    config.RSSpollDelay = DefaultRSSpollMaxDelay
+	}
+
+	// Telegram message delay (milliseconds)
+	if config.TGmsgDelay < 0 {
+	    config.TGmsgDelay = 0
+	}
+	if config.TGmsgDelay > MaxTGmsgDelay {
+	    config.TGmsgDelay = MaxTGmsgDelay
+	}
+
 	return &config, nil
 }
 
@@ -258,7 +306,7 @@ func logMessage(level, message string, userID ...int64) {
 
 	color := colors[level]
 	icon := icons[level]
-	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	timestamp := time.Now().Format(TimeStampFormat)
 
 	userInfo := ""
 	if len(userID) > 0 && userID[0] != 0 {
@@ -388,6 +436,7 @@ func NewMessageSender(bot *tgbotapi.BotAPI) *MessageSender {
 
 // SendResponse either edits an existing message (messageID > 0) or sends a new one.
 func (m *MessageSender) SendResponse(userID int64, messageID int, text string, keyboard *tgbotapi.InlineKeyboardMarkup) error {
+	tgDelay()
 	if messageID > 0 {
 		edit := tgbotapi.NewEditMessageText(userID, messageID, text)
 		if keyboard != nil {
@@ -407,6 +456,7 @@ func (m *MessageSender) SendResponse(userID int64, messageID int, text string, k
 // SendHTMLResponse sends or edits a message using HTML parse mode.
 // The optional disablePreview parameter suppresses link previews when true.
 func (m *MessageSender) SendHTMLResponse(userID int64, messageID int, text string, keyboard *tgbotapi.InlineKeyboardMarkup, disablePreview ...bool) error {
+	tgDelay()
 	logMessage("debug", fmt.Sprintf("SendHTMLResponse: messageID=%d, textLen=%d", messageID, len(text)), userID)
 
 	shouldDisablePreview := false
@@ -580,7 +630,7 @@ func (h *UserActionHandler) handleKeywordAction(userID int64, messageID int, act
 	switch action {
 	case "add_prompt":
 		setUserState(userID, "add_keyword", messageID, nil)
-		text := "Please enter the keyword(s) to add. Separate multiple keywords with #!#\n\n" +
+		text := "Please enter the keyword(s) to add. For multiple keywords, just place each keyword on a new line\n\n" +
 			"💡 Matching tips:\n" +
 			" * matches any sequence of characters\n" +
 			" -keyword blocks content containing that keyword\n" +
@@ -613,7 +663,7 @@ func (h *UserActionHandler) handleKeywordAction(userID int64, messageID int, act
 		}
 		clearUserState(userID)
 		keyboard := CreateBackButton()
-		h.sender.SendResponse(userID, messageID, result, &keyboard)
+		h.sender.SendHTMLResponse(userID, messageID, result, &keyboard)
 
 	case "view":
 		h.viewKeywords(userID, messageID)
@@ -712,6 +762,22 @@ func (h *UserActionHandler) showDeleteKeywords(userID int64, messageID int) {
 	h.sender.SendResponse(userID, messageID, "Select the keyword to delete:", &keyboard)
 }
 
+/*
+SiegerExtra note @2026.06.30 15:09
+[Issue]
+Keywords longer than 57 bytes, also consider Unicode
+will render [Delete keyword] visual functionality inoperationa (fails silently),
+until all such keywords are manually or script-removed from the database.
+[Cause]
+Telegram has a 64-byte limit for callback data. When your keyword exceeds this limit, the callback is silently dropped.
+The 64-byte limit includes the prefix (del_kw_ + keyword). del_kw_ is 7 characters,
+so the maximum keyword length is 57 bytes (64 - 7).
+[Solution]
+Code can be rewritten, for example to pass indexes to callback, instead of whole keyword strings.
+
+But, to simplify staff, limited keywords to 57 chars during adding/parsing, since longer keywords are generally unnecessary
+*/
+
 func (h *UserActionHandler) deleteKeyword(userID int64, messageID int, keyword string) {
 	result, err := removeKeywordForUser(userID, keyword)
 	if err != nil {
@@ -721,7 +787,7 @@ func (h *UserActionHandler) deleteKeyword(userID int64, messageID int, keyword s
 	}
 
 	keyboard := CreateBackButton()
-	h.sender.SendResponse(userID, messageID, result, &keyboard)
+	h.sender.SendHTMLResponse(userID, messageID, result, &keyboard)
 
 	// Refresh the delete list after a short delay if more keywords remain.
 	go func() {
@@ -819,18 +885,21 @@ func (h *UserActionHandler) deleteSubscription(userID int64, messageID int, subs
 // Formatting helpers
 // ---------------------------------------------------------------------------
 
+// formatKeywordList returns a formatted string of keywords, one per line with monospace font
+func formatKeywordsListWorker(keywords []string) string {
+    if len(keywords) == 0 {
+        return "📋 No keywords found."
+    }
+    
+    var rows []string
+    for i, kw := range keywords {
+        rows = append(rows, fmt.Sprintf("%d. <code>%s</code>", i+1, kw))
+    }
+    return strings.Join(rows, "\n")
+}
+
 func (h *UserActionHandler) formatKeywordsList(keywords []string) string {
-	var rows []string
-	var currentRow []string
-
-	for i, kw := range keywords {
-		currentRow = append(currentRow, fmt.Sprintf("%d.<code>%s</code>", i+1, kw))
-		if i == len(keywords)-1 {
-			rows = append(rows, strings.Join(currentRow, "  "))
-		}
-	}
-
-	return fmt.Sprintf("📋 Your keywords (%d total):\n\n%s", len(keywords), strings.Join(rows, "\n"))
+    return fmt.Sprintf("📋 Your keywords (%d total):\n\n%s", len(keywords), formatKeywordsListWorker(keywords))
 }
 
 func (h *UserActionHandler) formatSubscriptionsList(subscriptions []SubscriptionInfo) string {
@@ -863,7 +932,7 @@ func main() {
 
 	if *showVersion {
 		//fmt.Printf("TGBot_RSS\n  Version:    %s\n  Build time: %s\n  Git commit: %s\n", version, buildTime, gitCommit)
-		fmt.Printf("TGBot_RSS %s\n", version)
+		fmt.Printf("TGBot_RSS/SiegerExtra %s\n", version)
 		os.Exit(0)
 	}
 
@@ -890,13 +959,22 @@ func main() {
 `
 	intro := fmt.Sprintf(`%s
 Welcome to TGBot_RSS/SiegerExtra
-Version:    %s
-Author:     SiegerExtra, original CN-only source code by AbBai @ github.com/IonRh/TGBot_RSS
+Version: %s
+Author: SiegerExtra
+	code forked from notoriously CN-only-interface app/code by AbBai
+	@ github.com/IonRh/TGBot_RSS
+-> because you know, not everyone of us are CN yet,
+so we've dealt with the original code in a better way =)
+	
 Repository: https://github.com/SiegerExtra/TGBot_RSS
-About:      TGBot_RSS/SiegerExtra is a flexible Telegram bot that pushes RSS feeds`, asciiArt, version/*, buildTime, gitCommit*/)
+	
+About: a lightweight Go-based Telegram.bot–based RSS/Atom multi-feed reader with
+       keyword/multiWildcard global/perFeed filtering,
+       Telegram.GUI-based general setup/control,
+       proxy support for feeds access`, asciiArt, version/*, buildTime, gitCommit*/)
 	logMessage("info", fmt.Sprintf(intro+"\n"))
 
-	logMessage("info", "RSS Bot starting...")
+	logMessage("info", "TGBot_RSS/SiegerExtra is starting...")
 
 	// Open and configure the SQLite database.
 	// A single shared connection pool is used throughout the application;
@@ -933,7 +1011,7 @@ About:      TGBot_RSS/SiegerExtra is a flexible Telegram bot that pushes RSS fee
 	}
 
 	bot.Debug = false
-	logMessage("info", fmt.Sprintf("Bot started — authenticated as @%s", bot.Self.UserName))
+	logMessage("info", fmt.Sprintf("Telegram bot started: authenticated as @%s and will be posting messages with %d ms delay, to prevent bot restrictions/throttling", bot.Self.UserName, globalConfig.TGmsgDelay))
 
 	// Initialise component singletons
 	messageSender = NewMessageSender(bot)
@@ -1025,7 +1103,8 @@ func handleStateMessage(message *tgbotapi.Message, state *UserState) {
 }
 
 // handleKeywordInput processes free-text keyword input from the user
-// Allowed keyword to contain spaces, and changed separator from ',' to '#!#'
+// Allowed keyword to contain spaces, and changed separator from original excessively-encountered ','
+// to a most natural one: newLine char (both /n and /r/n are supported)
 func handleKeywordInput(message *tgbotapi.Message) {
     userID := message.From.ID
     text := strings.TrimSpace(message.Text)
@@ -1035,23 +1114,54 @@ func handleKeywordInput(message *tgbotapi.Message) {
     }
 
     var keywords []string
+    var skipped []string
 
-    // Split by #!# separator
-    if strings.Contains(text, "#!#") {
-        for _, part := range strings.Split(text, "#!#") {
+    // Split by newline (multi-line input)
+    if strings.Contains(text, "\n") {
+        for _, part := range strings.Split(text, "\n") {
             if trimmed := strings.TrimSpace(part); trimmed != "" {
-                keywords = append(keywords, trimmed)
+                trimmed = strings.TrimSuffix(trimmed, "\r")
+                // Check bytes length
+                // Max 57 bytes for Telegram callback, which is used to pass whole keyword string, in original source code by AbBai
+                if len(trimmed) <= MaxKeywordLength {
+                    keywords = append(keywords, trimmed)
+                } else {
+                    skipped = append(skipped, fmt.Sprintf("<code>%s</code> (%d bytes)", trimmed, len(trimmed)))
+                }
             }
         }
     } else {
-        // No separator: treat the entire input as one keyword
-        keywords = []string{text}
+        // Single line: treat as one keyword
+        if len(text) <= MaxKeywordLength {
+            keywords = []string{text}
+        } else {
+            skipped = []string{text}
+        }
+    }
+
+    if len(keywords) == 0 && len(skipped) > 0 {
+        messageSender.SendError(userID, 0, fmt.Sprintf("❌ Keyword(s) too long, max %d bytes):\n%s", MaxKeywordLength, strings.Join(skipped, "\n")))
+        return
     }
 
     if len(keywords) == 0 {
         messageSender.SendError(userID, 0, "❌ Please enter a valid keyword.")
         return
     }
+
+    // If some keywords were skipped, inform the user
+	if len(skipped) > 0 {
+	    var skippedFormatted []string
+	    for _, kw := range skipped {
+	        skippedFormatted = append(skippedFormatted, fmt.Sprintf("%s", kw))
+	    }
+	    msg := fmt.Sprintf("⚠️ Keywords skipped, longer than %d bytes:\n%s\n\n",
+	        MaxKeywordLength, strings.Join(skippedFormatted, "\n"))
+	    // Proceed with valid keywords
+	    actionHandler.HandleAction(userID, 0, "keyword", "add", keywords...)
+	    sendHTMLMessage(userID, msg)
+	    return
+	}
 
     actionHandler.HandleAction(userID, 0, "keyword", "add", keywords...)
 }
@@ -1098,12 +1208,18 @@ Please choose an action:`,
 func showHelp(userID int64, messageID int) {
 	count := downloadcounnt()
 	helpText := fmt.Sprintf(`🤖 RSS Subscription Bot
-📰 TGBot_RSS downloads: %d
+📰 TGBot_RSS/SiegerExtra downloads: %d
 
 📝 <b>Usage guide</b> (if pushes are not arriving, try the following)
 
+⌨️<b>Chat commands/aliases, character case-insensitive</b>
+<code>/start /s</code> displays GUI menu
+<code>/help /h</code> displays this Help
+<code>/version /v</code> displays version of this bot
+<code>/resetLastUpdateTime /r $days[1-99]</code> resets feeds last update timeStamp, allowing quickly re-match feeds for setup/debug
+
 🔤 <b>Basic keywords</b>
-• Supports any language; separate multiple keywords with commas
+• Supports any language; separate multiple keywords with #!#
 • Regular expressions are supported for advanced matching
 
 🎯 <b>Advanced matching</b>
@@ -1125,10 +1241,78 @@ func showHelp(userID int64, messageID int) {
 • Omitting +FeedName matches all subscribed feeds
 
 📦 Repository: github.com/SiegerExtra/TGBot_RSS
-🔧 Feedback:   github.com/SiegerExtra/TGBot_RSS`, count)
+🔧 Feedback:   github.com/SiegerExtra/TGBot_RSS/Issues`, count)
 
 	keyboard := CreateBackButton()
 	messageSender.SendHTMLResponse(userID, messageID, helpText, &keyboard, true)
+}
+
+// resetLastUpdateTime resets the last_update_time for the user's subscriptions
+// to midnight of (days) days ago.
+func resetLastUpdateTime(userID int64, days int) {
+    if days < 1 || days > 99 {
+        sendMessage(userID, "❌ Please specify a number between 1 and 99.")
+        return
+    }
+
+    loc, _ := time.LoadLocation(globalConfig.TimeZone)
+    // Get target date, incl. resetting time to 'start of day' for selected timeZone
+	targetDate := time.Date(time.Now().In(loc).Year(), time.Now().In(loc).Month(), time.Now().In(loc).Day()-days, 0, 0, 0, 0, loc).Format(TimeStampFormat)
+
+    // Construct the SQLite datetime expression
+    sqlExpr := fmt.Sprintf("datetime('now', '-%d days', 'start of day')", days)
+
+    // Get all subscription names for this user
+    subscriptions, err := getSubscriptionsForUser(userID)
+    if err != nil {
+        logMessage("error", fmt.Sprintf("Failed to get user subscriptions: %v", err), userID)
+        sendMessage(userID, "❌ Failed to get subscriptions. Check logs for details.")
+        return
+    }
+
+    if len(subscriptions) == 0 {
+        sendMessage(userID, "ℹ️ You have no subscriptions to reset.")
+        return
+    }
+
+    // Build the list of rss_names to update
+    var names []string
+    for _, sub := range subscriptions {
+        names = append(names, sub.Name)
+    }
+
+    // Build the IN clause
+    placeholders := strings.Repeat("?,", len(names))
+    placeholders = placeholders[:len(placeholders)-1] // Remove trailing comma
+
+    query := fmt.Sprintf("UPDATE feed_data SET last_update_time = %s WHERE rss_name IN (%s)", sqlExpr, placeholders)
+
+    // Convert names to []interface{} for the Exec arguments
+    args := make([]interface{}, len(names))
+    for i, name := range names {
+        args[i] = name
+    }
+
+    result, err := db.Exec(query, args...)
+    if err != nil {
+        logMessage("error", fmt.Sprintf("Failed to reset last_update_time: %v", err), userID)
+        sendMessage(userID, "❌ Failed to reset update times. Check logs for details.")
+        return
+    }
+
+    count, err := result.RowsAffected()
+    if err != nil {
+        logMessage("error", fmt.Sprintf("Failed to get affected rows: %v", err), userID)
+        sendMessage(userID, fmt.Sprintf("✅ Reset last_update_time to %d day(s) ago.", days))
+        return
+    }
+
+    logMessage("info", fmt.Sprintf("Reset last_update_time to %d day(s) ago for %d subscription(s) for user %d", days, count, userID), userID)
+    sendMessage(userID, fmt.Sprintf("✅ For all your subscriptions (%d),\nlast feed update timeStamp was reset to %d day(s) ago: %s", count, days, targetDate))
+
+	//Called for all feeds for all users, but it's OK
+	//since timeStamps were only reset for target userID's subscriptions
+    checkAllRSS()
 }
 
 // handleCommand dispatches bot commands (e.g. /start, /help).
@@ -1147,16 +1331,45 @@ func handleCommand(message *tgbotapi.Message) {
 
 	from := message.From.FirstName + " " + message.From.LastName
 	command := message.Command()
+	args := message.CommandArguments()
 
-	logMessage("debug", fmt.Sprintf("Command received: %s", command), userID)
+	logMessage("debug", fmt.Sprintf("Received command '%s' with args '%s'", command, args), userID)
+	command = strings.ToLower(command) //Normalize command char-case to lowerCase
 
-	switch command {
-	case "start":
+	switch (command) { 
+	case "start", "s":
 		clearUserState(userID)
 		showMainMenu(userID, from, 0)
 
-	case "help":
+	case "help", "h":
 		showHelp(userID, 0)
+
+	case "version", "v": // Display version information
+		versionMsg := fmt.Sprintf(
+			"🤖TGBot_RSS/SiegerExtra\n"+
+				" Version: %s\n"+
+				" Build: %s\n"+
+				" 📦https://github.com/SiegerExtra/TGBot_RSS",
+			version, buildTime)
+		sendMessage(userID, versionMsg)
+
+	case "resetlastupdatetime", "r": // resetLastUpdateTime
+        var days int
+    	var err error
+        
+        if args == "" {
+        	days = 1
+            sendMessage(userID, "✅ No args supplied for the command,\nperforming default /resetLastUpdateTime 1")
+        } else {
+        	days, err = strconv.Atoi(args)
+        }
+
+        if err != nil || days < 1 || days > 99 {
+            sendMessage(userID, "❌ Please specify a number of days 1-99, e.g.: /r 7")
+            return
+        }
+        
+        resetLastUpdateTime(userID, days)
 
 	default:
 		sendMessage(userID, fmt.Sprintf("Unknown command: %s\nUse /start for the menu or /help for assistance.", command))
@@ -1251,12 +1464,19 @@ func createMainMenuKeyboard() tgbotapi.InlineKeyboardMarkup {
 // Low-level send helpers
 // ---------------------------------------------------------------------------
 
+// tgDelay applies a configurable delay between Telegram message sends
+// If TGmsgDelay is 0, no delay is applied
+func tgDelay() {
+    time.Sleep(time.Duration(globalConfig.TGmsgDelay) * time.Millisecond)
+}
+
 // sendMessage sends a plain-text message to userID.
 func sendMessage(userID int64, text string) {
 	msg := tgbotapi.NewMessage(userID, text)
 	if _, err := bot.Send(msg); err != nil {
 		logMessage("error", fmt.Sprintf("Failed to send message: %v", err), userID)
 	}
+	tgDelay()
 }
 
 // sendHTMLMessage sends an HTML-formatted message to userID.
@@ -1266,6 +1486,7 @@ func sendHTMLMessage(userID int64, text string) {
 	if _, err := bot.Send(msg); err != nil {
 		logMessage("error", fmt.Sprintf("Failed to send HTML message: %v", err), userID)
 	}
+	tgDelay()
 }
 
 // sendPhotoMessage sends a photo with an HTML caption.
@@ -1280,6 +1501,7 @@ func sendPhotoMessage(userID int64, photoURL, caption string) {
 		fallbackMsg := fmt.Sprintf("Image: %s\n\n%s", photoURL, caption)
 		sendHTMLMessage(userID, fallbackMsg)
 	}
+	tgDelay()
 }
 
 // ---------------------------------------------------------------------------
@@ -1370,82 +1592,58 @@ func getKeywordsForUser(userID int64) ([]string, error) {
 
 // addKeywordsForUser merges newKeywords into the existing set for userID.
 func addKeywordsForUser(userID int64, newKeywords []string) (string, error) {
-	existingKeywords, err := getKeywordsForUser(userID)
-	if err != nil {
-		return "", err
-	}
+    existingKeywords, err := getKeywordsForUser(userID)
+    if err != nil {
+        return "", err
+    }
 
-	// Deduplicate using a map
-	keywordMap := make(map[string]bool)
-	for _, k := range existingKeywords {
-		keywordMap[k] = true
-	}
+    // Deduplicate using a map
+    keywordMap := make(map[string]bool)
+    for _, k := range existingKeywords {
+        keywordMap[k] = true
+    }
 
-	// Expand comma-separated input and normalise fullwidth commas
-	var processedKeywords []string
-	for _, k := range newKeywords {
-		k = strings.ReplaceAll(k, "\uff0c", ",") // normalise fullwidth comma -> ASCII comma
-		if strings.Contains(k, ",") {
-			for _, part := range strings.Split(k, ",") {
-				if trimmed := strings.TrimSpace(part); trimmed != "" {
-					processedKeywords = append(processedKeywords, trimmed)
-				}
-			}
-		} else {
-			if trimmed := strings.TrimSpace(k); trimmed != "" {
-				processedKeywords = append(processedKeywords, trimmed)
-			}
-		}
-	}
+    // Add new keywords (already trimmed by handleKeywordInput)
+    var addedCount int
+    for _, k := range newKeywords {
+        if k == "" {
+            continue
+        }
+        if !keywordMap[k] {
+            keywordMap[k] = true
+            addedCount++
+        }
+    }
 
-	var addedCount int
-	for _, k := range processedKeywords {
-		if !keywordMap[k] {
-			keywordMap[k] = true
-			addedCount++
-		}
-	}
+    if addedCount == 0 {
+        return "❌ No new keywords added — all already exist.", nil
+    }
 
-	if addedCount == 0 {
-		return "❌ No new keywords added — all already exist.", nil
-	}
+    var finalKeywords []string
+    for k := range keywordMap {
+        finalKeywords = append(finalKeywords, k)
+    }
+    sort.Strings(finalKeywords)
 
-	var finalKeywords []string
-	for k := range keywordMap {
-		finalKeywords = append(finalKeywords, k)
-	}
-	sort.Strings(finalKeywords)
+    keywordsJSON, err := json.Marshal(finalKeywords)
+    if err != nil {
+        return "", err
+    }
 
-	keywordsJSON, err := json.Marshal(finalKeywords)
-	if err != nil {
-		return "", err
-	}
+    err = withDB(func(db *sql.DB) error {
+        _, err := db.Exec(
+            "INSERT INTO user_keywords (user_id, keywords) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET keywords = excluded.keywords",
+            userID, string(keywordsJSON),
+        )
+        return err
+    })
+    if err != nil {
+        return "", err
+    }
 
-	// Upsert using a single INSERT OR REPLACE to avoid the redundant COUNT query
-	err = withDB(func(db *sql.DB) error {
-		_, err = db.Exec(
-			"INSERT INTO user_keywords (user_id, keywords) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET keywords = excluded.keywords",
-			userID, string(keywordsJSON),
-		)
-		return err
-	})
-	if err != nil {
-		return "", err
-	}
-
-	var rows []string
-	var currentRow []string
-	for i, kw := range finalKeywords {
-		currentRow = append(currentRow, fmt.Sprintf("%d.%s", i+1, kw))
-		if i == len(finalKeywords)-1 {
-			rows = append(rows, strings.Join(currentRow, "  "))
-		}
-	}
-
-	logMessage("info", fmt.Sprintf("✅ Added %d keyword(s). Total: %d. List: %s",
-		addedCount, len(finalKeywords), strings.Join(rows, "\n")))
-	return fmt.Sprintf("✅ Added %d keyword(s)\nTotal: %d keyword(s)\n\n📋 Keyword list:\n%s",
-		addedCount, len(finalKeywords), strings.Join(rows, "\n")), nil
+    logMessage("info", fmt.Sprintf("✅ Added %d keyword(s). Total: %d.", addedCount, len(finalKeywords)))
+    return fmt.Sprintf("✅ Added %d keyword(s)\nTotal: %d keyword(s)\n\n📋 Keyword list:\n%s",
+        addedCount, len(finalKeywords), formatKeywordsListWorker(finalKeywords)), nil
 }
 
 // removeKeywordForUser deletes keyword from userID's list.
@@ -1466,7 +1664,7 @@ func removeKeywordForUser(userID int64, keyword string) (string, error) {
 	}
 
 	if !found {
-		return fmt.Sprintf("❌ Keyword \"%s\" not found.", keyword), nil
+		return fmt.Sprintf("❌ Keyword\n<code>%s</code>\nnot found.", keyword), nil
 	}
 
 	keywordsJ := "[]"
@@ -1487,22 +1685,12 @@ func removeKeywordForUser(userID int64, keyword string) (string, error) {
 	}
 
 	if len(newKeywords) == 0 {
-		return fmt.Sprintf("✅ Keyword \"%s\" deleted.\nNo keywords remaining.", keyword), nil
+		return fmt.Sprintf("✅ Keyword\n<code>%s</code>\ndeleted.\n\nNo keywords remaining.", keyword), nil
 	}
 
 	sort.Strings(newKeywords)
-
-	var rows []string
-	var currentRow []string
-	for i, kw := range newKeywords {
-		currentRow = append(currentRow, fmt.Sprintf("%d.%s", i+1, kw))
-		if i == len(newKeywords)-1 {
-			rows = append(rows, strings.Join(currentRow, "  "))
-		}
-	}
-
-	return fmt.Sprintf("✅ Keyword \"%s\" deleted.\n%d keyword(s) remaining.\n\n📋 Keyword list:\n%s",
-		keyword, len(newKeywords), strings.Join(rows, "\n")), nil
+	return fmt.Sprintf("✅ Keyword\n<code>%s</code>\ndeleted.\n%d keyword(s) remaining.\n\n📋 Keyword list:\n%s",
+        keyword, len(newKeywords), formatKeywordsListWorker(newKeywords)), nil
 }
 
 // getSubscriptionsForUser returns all subscriptions that include userID.
@@ -1772,9 +1960,9 @@ func startRSSMonitor() {
 	ticker := time.NewTicker(time.Duration(globalConfig.Cycletime) * time.Minute)
 	defer ticker.Stop()
 
-	// Run an initial check immediately at startup
+	// Run an initial RSS poll immediately at startup
+	logMessage("info", "RSS reader started")
 	checkAllRSS()
-	logMessage("info", fmt.Sprintf("Bot started — RSS will be checked every %d minute(s)", globalConfig.Cycletime))
 
 	for range ticker.C {
 		go func() {

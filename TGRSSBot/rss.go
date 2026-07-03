@@ -1,20 +1,7 @@
 /*
 TGBot_RSS/SiegerExtra @ github.com/SiegerExtra/TGBot_RSS
-	Forked from notoriously CN-only interface app/code by AbBai @ github.com/IonRh/TGBot_RSS
-	-> because you know, not all of us are from CN, and thus unwilling to tolerate it =)
-
-Changelog:
-v1.0.6
-	Changed standart mode output to also include subscription/feed name;
-	Changed original fixed CN-timeZone to be instead configurable via config.json\TimeZone;
-
-v1.0.5
-	Elaborated keywords to allow for spaces, e.g. 'key word';
-	Changed original keywords separator from ','' to '#!#';
-
-v1.0.4
-	Fully replaced all CN-strings with EN-strings;
-	Reworked database access so it uses connections efficiently;
+	Forked from notoriously CN-only-interface app/code by AbBai @ github.com/IonRh/TGBot_RSS
+	-> because you know, not everyone of us are CN yet, so we've dealt with the original code in a better way =)
 */
 
 package main
@@ -199,7 +186,7 @@ func getLastUpdateTime(db *sql.DB, rssName string) (time.Time, error) {
 		// immediately re-deliver all historical items.
 		_, err = db.Exec(
 			"INSERT INTO feed_data (rss_name, last_update_time, latest_title) VALUES (?, ?, ?)",
-			rssName, time.Now().Format("2006-01-02 15:04:05"), "",
+			rssName, time.Now().Format(TimeStampFormat), "",
 		)
 		return time.Time{}, err
 	}
@@ -215,7 +202,7 @@ func getLastUpdateTime(db *sql.DB, rssName string) (time.Time, error) {
 func updateLastTime(db *sql.DB, rssName string, updateTime time.Time, title string) {
 	_, err := db.Exec(
 		"UPDATE feed_data SET last_update_time = ?, latest_title = ? WHERE rss_name = ?",
-		updateTime.Format("2006-01-02 15:04:05"), title, rssName,
+		updateTime.Format(TimeStampFormat), title, rssName,
 	)
 	if err != nil {
 		logMessage("error", fmt.Sprintf("Failed to update last time: %v", err))
@@ -334,7 +321,7 @@ func matchesKeywords(msg Message, keywords []string, rssName string) []string {
 // processSubscription fetches new items for sub and delivers matching ones to subscribers.
 func processSubscription(db *sql.DB, sub Subscription, userKeywords map[int64][]string, client *http.Client) {
 	if cyclenum == 0 {
-		logMessage("info", fmt.Sprintf("Processing subscription: %s (%s)", sub.Name, sub.URL))
+		logMessage("info", fmt.Sprintf("Processing subscription: %s @ %s", sub.Name, sub.URL))
 	}
 
 	messages, err := fetchRSS(db, sub, client)
@@ -384,8 +371,8 @@ func processSubscription(db *sql.DB, sub Subscription, userKeywords map[int64][]
 
 			// Format the time with timezone offset
 			tzTime := msg.PubDate.In(loc)
-			formattedDate := tzTime.Format("2006-01-02 15:04:05")
-			timezoneOffset := tzTime.Format("-07")
+			formattedDate := tzTime.Format(TimeStampFormat)
+			timezoneOffset := tzTime.Format(TimeZoneFormat)
 
 			var htmlMessage, otherpush string
 
@@ -421,45 +408,53 @@ func processSubscription(db *sql.DB, sub Subscription, userKeywords map[int64][]
 }
 
 // checkAllRSS is called on each ticker tick.
-// It reuses the global db connection passed in from startRSSMonitor instead
-// of opening a fresh connection on every cycle.
+// It reuses the global db connection passed in from startRSSMonitor
+// instead of opening a fresh connection on every cycle.
 func checkAllRSS() {
-	startTime := time.Now()
-	resetPushStatsIfNeeded()
-	logMessage("info", "Checking RSS subscriptions...")
+    startTime := time.Now()
+    resetPushStatsIfNeeded()
+    logMessage("info", fmt.Sprintf("RSS reader: polling subscriptions now. Entire subscription-pool is polled every %d min, while using %d sec delay between each single feed polling", globalConfig.Cycletime, globalConfig.RSSpollDelay))
 
-	subscriptions, err := getSubscriptions(db)
-	if err != nil {
-		logMessage("error", fmt.Sprintf("Failed to load subscriptions: %v", err))
-		return
-	}
+    subscriptions, err := getSubscriptions(db)
+    if err != nil {
+        logMessage("error", fmt.Sprintf("Failed to load subscriptions: %v", err))
+        return
+    }
 
-	if len(subscriptions) == 0 {
-		logMessage("info", "No RSS subscriptions found.")
-		return
-	}
+    if len(subscriptions) == 0 {
+        logMessage("info", "No RSS subscriptions found.")
+        return
+    }
 
-	userKeywords, err := getUserKeywords(db)
-	if err != nil {
-		logMessage("error", fmt.Sprintf("Failed to load user keywords: %v", err))
-		return
-	}
+    userKeywords, err := getUserKeywords(db)
+    if err != nil {
+        logMessage("error", fmt.Sprintf("Failed to load user keywords: %v", err))
+        return
+    }
 
-	client := createHTTPClient(globalConfig.ProxyURL)
+    client := createHTTPClient(globalConfig.ProxyURL)
 
-	// Process all subscriptions concurrently
-	var wg sync.WaitGroup
-	for _, sub := range subscriptions {
-		wg.Add(1)
-		go func(sub Subscription) {
-			defer wg.Done()
-			processSubscription(db, sub, userKeywords, client)
-		}(sub)
-	}
+    if globalConfig.RSSpollDelay == 0 {
+        // Concurrent processing via goroutines (original behavior)
+        var wg sync.WaitGroup
+        for _, sub := range subscriptions {
+            wg.Add(1)
+            go func(sub Subscription) {
+                defer wg.Done()
+                processSubscription(db, sub, userKeywords, client)
+            }(sub)
+        }
+        wg.Wait()
+    } else {
+        // Sequential processing with delay, to prevent target services overuse/bans
+        for _, sub := range subscriptions {
+            processSubscription(db, sub, userKeywords, client)
+            time.Sleep(time.Duration(globalConfig.RSSpollDelay) * time.Second)
+        }
+    }
 
-	wg.Wait()
-	logMessage("info", fmt.Sprintf("RSS check complete — elapsed: %v", time.Since(startTime)))
-	cyclenum = 1
+    logMessage("info", fmt.Sprintf("RSS check complete — elapsed: %v", time.Since(startTime)))
+    cyclenum = 1
 }
 
 // extractImageURL searches htmlContent for the first image URL.
