@@ -12,7 +12,7 @@ on:
         default: ''
 
 jobs:
-  build-and-release:
+  BuildAndRelease_GoBinaries_LinuxAndWindows:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -41,7 +41,7 @@ jobs:
           docker run --rm \
             -v $(pwd)/TGRSSBot:/go/src/app \
             -w /go/src/app \
-            golang:bullseye /bin/bash -c "
+            golang:latest /bin/bash -c "
               set -e
               apt-get update && apt-get install -y --no-install-recommends \
                 git ca-certificates zip \
@@ -92,7 +92,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd TGRSSBot/dist
-          sha256sum * > TGBot_RSS_${{ env.VERSION }}_Checksums.sha256
+          sha256sum * > TGBot_RSS_${{ env.VERSION }}_checksums.sha256
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
