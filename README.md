@@ -29,20 +29,7 @@ https://github.com/SiegerExtra/TGBot_RSS
 Forked from *notoriously* `CN-only-interface` app/code by AbBai @ github.com/IonRh/TGBot_RSS\
 *-> because you know, not everyone of us are CN yet, so we've dealt with the original code in a better way =)*
 
-## Quick Start
-### `bash-script` for automated deployment/update on Linux (amd64/arm64/armv7)
-- includes automated setup for a service, running as separate restricted-service-user,
-	so *"your funds are SAFU"*, of course until they are not ;)
-```bash
-# Download and Run install script
-curl -sL https://raw.githubusercontent.com/SiegerExtra/TGBot_RSS/refs/heads/main/TGBot_RSS.sh | bash
-
-sudo -e /usr/local/tgbot-rss/config.json # Populate/adjust config.json with your desired settings
-sudo systemctl status tgbot-rss # Check target service
-sudo systemctl enable --now tgbot-rss # Enable and start target service
-```
-
-### Manual deployment, if desired
+### Deployment
 - Download and unpack latest release, e.g. to your `home folder`
 - Populate/adjust `config.json` with your desired settings
 - Test-run with `./TGBot_RSS`
